@@ -1,0 +1,59 @@
+###############################################################################
+# PMOVES Tailscale Subnet Router (Docker)
+#
+# Advertises the Docker bridge subnet to the tailnet so all compose services
+# become reachable without individual Tailscale identities.
+#
+# Preferred for VPS deployments where host-level install may be restricted.
+#
+# Usage:
+#   docker compose -f docker-compose.tailscale-router.yml up -d
+#   docker exec pmoves-tailscale tailscale status
+###############################################################################
+
+services:
+  tailscale:
+    image: tailscale/tailscale:latest
+    container_name: pmoves-tailscale
+    hostname: ${TAILSCALE_HOSTNAME:-pmoves-vps}
+    restart: unless-stopped
+    cap_add:
+      - NET_ADMIN
+      - SYS_MODULE
+    volumes:
+      - tailscale-state:/var/lib/tailscale
+      - /dev/net/tun:/dev/net/tun
+    environment:
+      TS_AUTHKEY: "${TAILSCALE_AUTHKEY}"
+      TS_STATE_DIR: /var/lib/tailscale
+      TS_ROUTES: "${TAILSCALE_ADVERTISE_ROUTES}"
+      TS_EXTRA_ARGS: >-
+        --login-server=${HEADSCALE_URL:-https://controlplane.tailscale.com}
+        --advertise-tags=${TAILSCALE_TAGS:-tag:pmoves-vps}
+        --hostname=${TAILSCALE_HOSTNAME:-pmoves-vps}
+        --accept-routes
+        --ssh
+      TS_USERSPACE: "${TS_USERSPACE:-false}"
+    sysctls:
+      - net.ipv4.ip_forward=1
+      - net.ipv6.conf.all.forwarding=1
+    healthcheck:
+      test: ["CMD", "tailscale", "status"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+    networks:
+      - pmoves_app
+    labels:
+      pmoves.service: tailscale-router
+      pmoves.role: network
+
+volumes:
+  tailscale-state:
+    name: pmoves-tailscale-state
+
+networks:
+  pmoves_app:
+    name: pmoves_app
+    external: true

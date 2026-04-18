@@ -1,0 +1,42 @@
+###############################################################################
+# PMOVES Tailscale Sidecar Pattern
+#
+# Gives a single Docker service its own Tailscale identity on the tailnet.
+# Use when you need per-service DNS names or access control.
+#
+# Usage: Extend your service's compose file to include this sidecar.
+#
+# Example in your docker-compose.yml:
+#   services:
+#     my-service:
+#       network_mode: "service:tailscale-sidecar"
+#       depends_on: [tailscale-sidecar]
+#     tailscale-sidecar:
+#       extends:
+#         file: PMOVES-Tailscale/docker/docker-compose.tailscale-sidecar.yml
+#         service: tailscale-sidecar
+###############################################################################
+
+services:
+  tailscale-sidecar:
+    image: tailscale/tailscale:latest
+    container_name: "${TS_SIDECAR_NAME:-pmoves-ts-sidecar}"
+    hostname: "${TS_SIDECAR_HOSTNAME:-pmoves-sidecar}"
+    restart: unless-stopped
+    cap_add:
+      - NET_ADMIN
+      - SYS_MODULE
+    volumes:
+      - "${TS_SIDECAR_NAME:-pmoves-ts-sidecar}-state:/var/lib/tailscale"
+    environment:
+      TS_AUTHKEY: "${TAILSCALE_AUTHKEY}"
+      TS_STATE_DIR: /var/lib/tailscale
+      TS_EXTRA_ARGS: >-
+        --login-server=${HEADSCALE_URL:-https://controlplane.tailscale.com}
+        --advertise-tags=${TAILSCALE_TAGS:-tag:pmoves}
+        --hostname=${TS_SIDECAR_HOSTNAME:-pmoves-sidecar}
+        --accept-routes
+      TS_USERSPACE: "${TS_USERSPACE:-true}"
+    labels:
+      pmoves.service: tailscale-sidecar
+      pmoves.role: network

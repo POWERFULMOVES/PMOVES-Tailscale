@@ -1,0 +1,66 @@
+# PMOVES Headscale Configuration Template
+# Reference: https://github.com/juanfont/headscale/blob/main/config-example.yaml
+#
+# IMPORTANT: Copy this to headscale.yaml and customize before deploying.
+# The Docker compose mounts this as /etc/headscale/config.yaml.
+
+server_url: "${HEADSCALE_URL:-http://localhost:8096}"
+listen_addr: 0.0.0.0:8080
+metrics_listen_addr: 0.0.0.0:9090
+
+# gRPC API (used by headscale-ui and CLI)
+grpc_listen_addr: 0.0.0.0:50443
+grpc_allow_insecure: false
+
+# IP allocation
+prefixes:
+  v4: 100.64.0.0/10
+  v6: fd7a:115c:a1e0::/48
+
+# Database — SQLite for simplicity, Postgres for production
+database:
+  type: sqlite
+  sqlite:
+    path: /var/lib/headscale/db.sqlite
+
+# DERP — use Tailscale's public DERP servers, add custom ones if needed
+derp:
+  server:
+    enabled: false
+  urls:
+    - https://controlplane.tailscale.com/derpmap/default
+  auto_update_enabled: true
+  update_frequency: 24h
+
+# DNS
+dns:
+  magic_dns: true
+  base_domain: pmoves.tailnet
+  nameservers:
+    global:
+      - 1.1.1.1
+      - 8.8.8.8
+  search_domains: []
+
+# Node expiry
+ephemeral_node_inactivity_timeout: 30m
+
+# Policy / ACL
+policy:
+  mode: file
+  path: /etc/headscale/acl.hujson
+
+# Logging
+log:
+  level: info
+
+# TLS — handled by Cloudflare tunnel, so disabled here
+tls_cert_path: ""
+tls_key_path: ""
+
+# OIDC (optional — uncomment for SSO)
+# oidc:
+#   issuer: https://accounts.google.com
+#   client_id: YOUR_CLIENT_ID
+#   client_secret: YOUR_CLIENT_SECRET
+#   scope: ["openid", "profile", "email"]
