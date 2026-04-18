@@ -38,14 +38,17 @@ command -v cloudflared >/dev/null 2>&1 || fatal "cloudflared not found. Install:
 
 # ── Create Tunnel ───────────────────────────────────────────────────────────
 
-EXISTING_TUNNEL=$(cloudflared tunnel list --output json 2>/dev/null | python3 -c "
+EXISTING_TUNNEL=$(cloudflared tunnel list --output json 2>/dev/null | \
+  python3 - "$TUNNEL_NAME" <<'PYEOF'
 import json, sys
 tunnels = json.load(sys.stdin)
+name = sys.argv[1]
 for t in tunnels:
-    if t.get('name') == '$TUNNEL_NAME':
+    if t.get('name') == name:
         print(t['id'])
         break
-" 2>/dev/null || echo "")
+PYEOF
+2>/dev/null || echo "")
 
 if [[ -n "$EXISTING_TUNNEL" ]]; then
   log "Tunnel '$TUNNEL_NAME' already exists (ID: $EXISTING_TUNNEL)"
