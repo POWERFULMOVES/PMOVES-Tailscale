@@ -1,0 +1,54 @@
+// PMOVES Headscale ACL Policy
+// Reference: https://tailscale.com/kb/1018/acls
+//
+// Tag owners define who can assign tags.
+// ACLs define traffic rules between tagged nodes.
+// SSH rules define Tailscale SSH access.
+{
+  "tagOwners": {
+    "tag:pmoves":       ["autogroup:admin"],
+    "tag:pmoves-vps":   ["autogroup:admin"],
+    "tag:workstation":  ["autogroup:admin"],
+    "tag:proxmox":      ["autogroup:admin"],
+    "tag:edge":         ["autogroup:admin"],
+    "tag:lab":          ["autogroup:admin"]
+  },
+
+  "groups": {
+    "group:admins": ["autogroup:admin"]
+  },
+
+  "acls": [
+    // All PMOVES nodes can talk to each other
+    {"action": "accept", "src": ["tag:pmoves"], "dst": ["tag:pmoves:*"]},
+
+    // Workstations have full access (for development)
+    {"action": "accept", "src": ["tag:workstation"], "dst": ["*:*"]},
+
+    // VPS nodes can reach workstations (for service mesh)
+    {"action": "accept", "src": ["tag:pmoves-vps"], "dst": ["tag:pmoves:*"]},
+
+    // Edge devices limited to pmoves-tagged hosts
+    {"action": "accept", "src": ["tag:edge"], "dst": ["tag:pmoves:*"]},
+
+    // Proxmox can reach everything (hypervisor management)
+    {"action": "accept", "src": ["tag:proxmox"], "dst": ["*:*"]}
+  ],
+
+  "ssh": [
+    // PMOVES nodes can SSH to each other as non-root
+    {
+      "action": "accept",
+      "src":    ["tag:pmoves"],
+      "dst":    ["tag:pmoves"],
+      "users":  ["autogroup:nonroot"]
+    },
+    // Workstations can SSH anywhere as any user
+    {
+      "action": "accept",
+      "src":    ["tag:workstation"],
+      "dst":    ["*"],
+      "users":  ["*"]
+    }
+  ]
+}

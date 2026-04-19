@@ -1,0 +1,53 @@
+###############################################################################
+# PMOVES Headscale — Self-hosted Tailscale control plane
+#
+# Start:  docker compose -f docker-compose.headscale.yml up -d
+# Logs:   docker compose -f docker-compose.headscale.yml logs -f
+# Create user: docker exec pmoves-headscale headscale users create pmoves
+# Create key:  docker exec pmoves-headscale headscale preauthkeys create \
+#                --user pmoves --reusable --expiration 90d
+###############################################################################
+
+services:
+  headscale:
+    image: headscale/headscale:0.23-alpine
+    container_name: pmoves-headscale
+    restart: unless-stopped
+    command: serve
+    volumes:
+      - ./headscale.yaml:/etc/headscale/config.yaml:ro
+      - headscale-data:/var/lib/headscale
+      - ./acl.hujson:/etc/headscale/acl.hujson:ro
+    ports:
+      - "${HEADSCALE_PORT:-8096}:8080"
+      - "${HEADSCALE_METRICS_PORT:-9190}:9090"
+    environment:
+      HEADSCALE_SERVER_URL: "${HEADSCALE_URL:-http://localhost:8096}"
+    healthcheck:
+      test: ["CMD", "headscale", "health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    labels:
+      pmoves.service: headscale
+      pmoves.role: control-plane
+
+  headscale-ui:
+    image: ghcr.io/gurucomputing/headscale-ui:latest
+    container_name: pmoves-headscale-ui
+    restart: unless-stopped
+    ports:
+      - "${HEADSCALE_UI_PORT:-8196}:443"
+    environment:
+      HEADSCALE_URL: "http://headscale:8080"
+    depends_on:
+      headscale:
+        condition: service_healthy
+    labels:
+      pmoves.service: headscale-ui
+      pmoves.role: admin
+
+volumes:
+  headscale-data:
+    name: pmoves-headscale-data
