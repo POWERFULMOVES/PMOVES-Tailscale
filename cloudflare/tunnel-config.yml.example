@@ -1,0 +1,47 @@
+# Cloudflare Tunnel Configuration for PMOVES Services
+#
+# This maps public domain names to internal services via Cloudflare Tunnels.
+# The tunnel is typically run via `cloudflared` (see main docker-compose, profile: cloudflare).
+#
+# To create a tunnel:
+#   cloudflared tunnel create pmoves-tunnel
+#   cloudflared tunnel route dns pmoves-tunnel headscale.pmoves.ai
+#
+# Reference: https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/
+
+tunnel: <TUNNEL_ID>
+credentials-file: /etc/cloudflared/<TUNNEL_ID>.json
+
+ingress:
+  # Headscale control plane
+  - hostname: headscale.pmoves.ai
+    service: http://pmoves-headscale:8080
+    originRequest:
+      noTLSVerify: true
+
+  # Headscale admin UI
+  - hostname: headscale-ui.pmoves.ai
+    service: https://pmoves-headscale-ui:443
+    originRequest:
+      noTLSVerify: true
+
+  # Agent Zero API
+  - hostname: api.pmoves.ai
+    service: http://agent-zero:8080
+    originRequest:
+      noTLSVerify: true
+
+  # TensorZero Gateway
+  - hostname: llm.pmoves.ai
+    service: http://tensorzero:3030
+
+  # Grafana Dashboard
+  - hostname: grafana.pmoves.ai
+    service: http://grafana:3000
+
+  # Hi-RAG v2
+  - hostname: rag.pmoves.ai
+    service: http://hirag-gateway-cpu:8086
+
+  # Catch-all (required)
+  - service: http_status:404
