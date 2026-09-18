@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 // Package c2n registers support for C2N (Control-to-Node) communications.
@@ -12,12 +12,16 @@ import (
 	"time"
 
 	"tailscale.com/control/controlclient"
+	"tailscale.com/feature"
 	"tailscale.com/tailcfg"
 	"tailscale.com/tempfork/httprec"
 	"tailscale.com/types/logger"
 )
 
 func init() {
+	if !feature.Register("c2n") {
+		return
+	}
 	controlclient.HookAnswerC2NPing.Set(answerC2NPing)
 }
 

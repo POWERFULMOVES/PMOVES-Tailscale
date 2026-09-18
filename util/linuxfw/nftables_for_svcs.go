@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 //go:build linux
@@ -226,6 +226,11 @@ func portMapRule(t *nftables.Table, ch *nftables.Chain, tun string, targetIP net
 				RegAddrMax:  1,
 				RegProtoMin: 2,
 				RegProtoMax: 2,
+				// The kernel sets this flag itself whenever a proto
+				// register is given, and reports it back when the rule
+				// is listed. Setting it here too keeps findRule's
+				// comparison of built vs. listed rules equal.
+				Specified: true,
 			},
 		},
 	}
@@ -236,7 +241,7 @@ func portMapRule(t *nftables.Table, ch *nftables.Chain, tun string, targetIP net
 // This metadata can then be used to find the rule.
 // https://github.com/google/nftables/issues/48
 func svcPortMapRuleMeta(svcName string, targetIP netip.Addr, pm PortMap) []byte {
-	return []byte(fmt.Sprintf("svc:%s,targetIP:%s:matchPort:%v,targetPort:%v,proto:%v", svcName, targetIP.String(), pm.MatchPort, pm.TargetPort, pm.Protocol))
+	return fmt.Appendf(nil, "svc:%s,targetIP:%s:matchPort:%v,targetPort:%v,proto:%v", svcName, targetIP.String(), pm.MatchPort, pm.TargetPort, pm.Protocol)
 }
 
 func (n *nftablesRunner) findRuleByMetadata(t *nftables.Table, ch *nftables.Chain, meta []byte) (*nftables.Rule, error) {
@@ -305,5 +310,5 @@ func protoFromString(s string) (uint8, error) {
 // This metadata can then be used to find the rule.
 // https://github.com/google/nftables/issues/48
 func svcRuleMeta(svcName string, origDst, dst netip.Addr) []byte {
-	return []byte(fmt.Sprintf("svc:%s,VIP:%s,ClusterIP:%s", svcName, origDst.String(), dst.String()))
+	return fmt.Appendf(nil, "svc:%s,VIP:%s,ClusterIP:%s", svcName, origDst.String(), dst.String())
 }

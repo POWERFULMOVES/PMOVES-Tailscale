@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 package tsconsensus
@@ -17,7 +17,6 @@ import (
 	"net/netip"
 	"os"
 	"path/filepath"
-	"runtime"
 	"strings"
 	"sync"
 	"testing"
@@ -27,7 +26,6 @@ import (
 	"github.com/hashicorp/go-hclog"
 	"github.com/hashicorp/raft"
 	"tailscale.com/client/tailscale"
-	"tailscale.com/cmd/testwrapper/flakytest"
 	"tailscale.com/ipn/store/mem"
 	"tailscale.com/net/netns"
 	"tailscale.com/tailcfg"
@@ -75,10 +73,10 @@ func fromCommand(bs []byte) (string, error) {
 	return args, nil
 }
 
-func (f *fsm) Apply(l *raft.Log) any {
+func (f *fsm) Apply(lg *raft.Log) any {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	s, err := fromCommand(l.Data)
+	s, err := fromCommand(lg.Data)
 	if err != nil {
 		return CommandResult{
 			Err: err,
@@ -115,8 +113,8 @@ func (f *fsm) Restore(rc io.ReadCloser) error {
 }
 
 func testConfig(t *testing.T) {
-	if runtime.GOOS == "windows" && cibuild.On() {
-		t.Skip("cmd/natc isn't supported on Windows, so skipping tsconsensus tests on CI for now; see https://github.com/tailscale/tailscale/issues/16340")
+	if cibuild.On() {
+		t.Skip("these integration tests don't always work well in CI and that's bad for CI; see https://github.com/tailscale/tailscale/issues/16340 and https://github.com/tailscale/tailscale/issues/18022")
 	}
 	// -race AND Parallel makes things start to take too long.
 	if !racebuild.On {
@@ -251,7 +249,6 @@ func warnLogConfig() Config {
 }
 
 func TestStart(t *testing.T) {
-	flakytest.Mark(t, "https://github.com/tailscale/tailscale/issues/15627")
 	testConfig(t)
 	control, controlURL := startControl(t)
 	ctx := context.Background()
@@ -299,7 +296,7 @@ func startNodesAndWaitForPeerStatus(t testing.TB, ctx context.Context, clusterTa
 	keysToTag := make([]key.NodePublic, nNodes)
 	localClients := make([]*tailscale.LocalClient, nNodes)
 	control, controlURL := startControl(t)
-	for i := 0; i < nNodes; i++ {
+	for i := range nNodes {
 		ts, key, _ := startNode(t, ctx, controlURL, fmt.Sprintf("node %d", i))
 		ps[i] = &participant{ts: ts, key: key}
 		keysToTag[i] = key
@@ -356,7 +353,7 @@ func createConsensusCluster(t testing.TB, ctx context.Context, clusterTag string
 	}
 
 	fxRaftConfigContainsAll := func() bool {
-		for i := 0; i < len(participants); i++ {
+		for i := range participants {
 			fut := participants[i].c.raft.GetConfiguration()
 			err = fut.Error()
 			if err != nil {
@@ -372,7 +369,6 @@ func createConsensusCluster(t testing.TB, ctx context.Context, clusterTag string
 }
 
 func TestApply(t *testing.T) {
-	flakytest.Mark(t, "https://github.com/tailscale/tailscale/issues/15627")
 	testConfig(t)
 	ctx := context.Background()
 	clusterTag := "tag:whatever"
@@ -437,7 +433,6 @@ func assertCommandsWorkOnAnyNode(t testing.TB, participants []*participant) {
 }
 
 func TestConfig(t *testing.T) {
-	flakytest.Mark(t, "https://github.com/tailscale/tailscale/issues/15627")
 	testConfig(t)
 	ctx := context.Background()
 	clusterTag := "tag:whatever"
@@ -477,7 +472,6 @@ func TestConfig(t *testing.T) {
 }
 
 func TestFollowerFailover(t *testing.T) {
-	flakytest.Mark(t, "https://github.com/tailscale/tailscale/issues/15627")
 	testConfig(t)
 	ctx := context.Background()
 	clusterTag := "tag:whatever"
@@ -549,7 +543,6 @@ func TestFollowerFailover(t *testing.T) {
 }
 
 func TestRejoin(t *testing.T) {
-	flakytest.Mark(t, "https://github.com/tailscale/tailscale/issues/15627")
 	testConfig(t)
 	ctx := context.Background()
 	clusterTag := "tag:whatever"
@@ -585,7 +578,6 @@ func TestRejoin(t *testing.T) {
 }
 
 func TestOnlyTaggedPeersCanDialRaftPort(t *testing.T) {
-	flakytest.Mark(t, "https://github.com/tailscale/tailscale/issues/15627")
 	testConfig(t)
 	ctx := context.Background()
 	clusterTag := "tag:whatever"
@@ -626,8 +618,8 @@ func TestOnlyTaggedPeersCanDialRaftPort(t *testing.T) {
 	}
 
 	isNetErr := func(err error) bool {
-		var netErr net.Error
-		return errors.As(err, &netErr)
+		_, ok := errors.AsType[net.Error](err)
+		return ok
 	}
 
 	err := getErrorFromTryingToSend(untaggedNode)
@@ -643,7 +635,6 @@ func TestOnlyTaggedPeersCanDialRaftPort(t *testing.T) {
 }
 
 func TestOnlyTaggedPeersCanBeDialed(t *testing.T) {
-	flakytest.Mark(t, "https://github.com/tailscale/tailscale/issues/15627")
 	testConfig(t)
 	ctx := context.Background()
 	clusterTag := "tag:whatever"
@@ -651,7 +642,7 @@ func TestOnlyTaggedPeersCanBeDialed(t *testing.T) {
 
 	// make a StreamLayer for ps[0]
 	ts := ps[0].ts
-	auth := newAuthorization(ts, clusterTag)
+	auth := newAuthorizationForTest(ts, clusterTag)
 
 	port := 19841
 	lns := make([]net.Listener, 3)
@@ -701,10 +692,12 @@ func TestOnlyTaggedPeersCanBeDialed(t *testing.T) {
 	conn.Close()
 
 	_, err = sl.Dial(a2, 2*time.Second)
+	if err == nil {
+		t.Fatal("expected dial error to untagged node, got none")
+	}
 	if err.Error() != "dial: peer is not allowed" {
 		t.Fatalf("expected dial: peer is not allowed, got: %v", err)
 	}
-
 }
 
 func TestOnlyTaggedPeersCanJoin(t *testing.T) {

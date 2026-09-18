@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 // Package appconnectors registers support for Tailscale App Connectors.
@@ -8,11 +8,15 @@ import (
 	"encoding/json"
 	"net/http"
 
+	"tailscale.com/feature"
 	"tailscale.com/ipn/ipnlocal"
 	"tailscale.com/tailcfg"
 )
 
 func init() {
+	if !feature.Register("appconnectors") {
+		return
+	}
 	ipnlocal.RegisterC2N("GET /appconnector/routes", handleC2NAppConnectorDomainRoutesGet)
 }
 

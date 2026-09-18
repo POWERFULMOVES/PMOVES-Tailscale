@@ -1,7 +1,7 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
-// The doctor package registers the "doctor" problem diagnosis support into the
+// Package doctor registers the "doctor" problem diagnosis support into the
 // rest of Tailscale.
 package doctor
 
@@ -16,12 +16,16 @@ import (
 	"tailscale.com/doctor/ethtool"
 	"tailscale.com/doctor/permissions"
 	"tailscale.com/doctor/routetable"
+	"tailscale.com/feature"
 	"tailscale.com/ipn/ipnlocal"
 	"tailscale.com/net/tsaddr"
 	"tailscale.com/types/logger"
 )
 
 func init() {
+	if !feature.Register("doctor") {
+		return
+	}
 	ipnlocal.HookDoctor.Set(visitDoctor)
 	ipnlocal.RegisterPeerAPIHandler("/v0/doctor", handleServeDoctor)
 }
@@ -63,7 +67,7 @@ func visitDoctor(ctx context.Context, b *ipnlocal.LocalBackend, logf logger.Logf
 	// IPs; this can interfere with our ability to connect to the Tailscale
 	// controlplane.
 	checks = append(checks, doctor.CheckFunc("dns-resolvers", func(_ context.Context, logf logger.Logf) error {
-		nm := b.NetMap()
+		nm := b.NetMapNoPeers()
 		if nm == nil {
 			return nil
 		}

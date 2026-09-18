@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 //go:build linux && !android
@@ -10,10 +10,14 @@ import (
 	"github.com/mdlayher/netlink"
 	"github.com/tailscale/wireguard-go/tun"
 	"golang.org/x/sys/unix"
+	"tailscale.com/feature"
 	"tailscale.com/net/tstun"
 )
 
 func init() {
+	if !feature.Register("linkspeed") {
+		return
+	}
 	tstun.HookSetLinkAttrs.Set(setLinkAttrs)
 }
 

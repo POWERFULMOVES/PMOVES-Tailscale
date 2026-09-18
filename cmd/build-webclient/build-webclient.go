@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 // The build-webclient tool generates the static resources needed for the
@@ -68,14 +68,11 @@ func build(toolDir, appDir string) error {
 		return fmt.Errorf("Cannot precompress: %w", err)
 	}
 
-	// Cleanup pre-compressed files.
+	// Cleanup: the original (uncompressed) files are not embedded; only the
+	// ".zst" variants are served.
 	for _, f := range compressedFiles {
 		if err := os.Remove(f); err != nil {
 			log.Printf("Failed to cleanup %q: %v", f, err)
-		}
-		// Removing intermediate ".br" version, we use ".gz" asset.
-		if err := os.Remove(f + ".br"); err != nil {
-			log.Printf("Failed to cleanup %q: %v", f+".gz", err)
 		}
 	}
 

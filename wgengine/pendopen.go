@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 //go:build !ts_omit_debug
@@ -68,7 +68,6 @@ func (e *userspaceEngine) trackOpenPreFilterIn(pp *packet.Parsed, t *tstun.Wrapp
 	res = filter.Accept // always
 
 	if pp.IPProto == ipproto.TSMP {
-		res = filter.DropSilently
 		rh, ok := pp.AsTailscaleRejectedHeader()
 		if !ok {
 			return
@@ -77,6 +76,15 @@ func (e *userspaceEngine) trackOpenPreFilterIn(pp *packet.Parsed, t *tstun.Wrapp
 			e.noteFlowProblemFromPeer(tsRejectFlow(rh), rh.Reason)
 		} else if f := tsRejectFlow(rh); e.removeFlow(f) {
 			e.logf("open-conn-track: flow %v %v > %v rejected due to %v", rh.Proto, rh.Src, rh.Dst, rh.Reason)
+		}
+		e.notifyConnRejectTSMPRecv(rh)
+		switch rh.Reason {
+		case packet.RejectedDueToUnknownAppConnectorTransitIP:
+			// Keep res = filter.Accept, don't drop this packet because it will
+			// be used later for further communication between app connector
+			// and client.
+		default:
+			res = filter.DropSilently
 		}
 		return
 	}
@@ -101,8 +109,8 @@ var (
 	appleIPRange = netip.MustParsePrefix("17.0.0.0/8")
 	canonicalIPs = sync.OnceValue(func() (checkIPFunc func(netip.Addr) bool) {
 		// https://bgp.he.net/AS41231#_prefixes
-		t := &bart.Table[bool]{}
-		for _, s := range strings.Fields(`
+		t := &bart.Lite{}
+		for s := range strings.FieldsSeq(`
 			91.189.89.0/24
 			91.189.91.0/24
 			91.189.92.0/24
@@ -115,12 +123,9 @@ var (
 			185.125.188.0/23
 			185.125.190.0/24
 			194.169.254.0/24`) {
-			t.Insert(netip.MustParsePrefix(s), true)
+			t.Insert(netip.MustParsePrefix(s))
 		}
-		return func(ip netip.Addr) bool {
-			v, _ := t.Lookup(ip)
-			return v
-		}
+		return t.Contains
 	})
 )
 
@@ -134,14 +139,14 @@ func (e *userspaceEngine) isOSNetworkProbe(dst netip.AddrPort) bool {
 	// iOS had log spam like:
 	// open-conn-track: timeout opening (100.115.73.60:52501 => 17.125.252.5:443); no associated peer node
 	if runtime.GOOS == "ios" && dst.Port() == 443 && appleIPRange.Contains(dst.Addr()) {
-		if _, ok := e.PeerForIP(dst.Addr()); !ok {
+		if _, ok := e.peerForIP(dst.Addr()); !ok {
 			return true
 		}
 	}
 	// NetworkManager; https://github.com/tailscale/tailscale/issues/13687
 	// open-conn-track: timeout opening (TCP 100.96.229.119:42798 => 185.125.190.49:80); no associated peer node
 	if runtime.GOOS == "linux" && dst.Port() == 80 && canonicalIPs()(dst.Addr()) {
-		if _, ok := e.PeerForIP(dst.Addr()); !ok {
+		if _, ok := e.peerForIP(dst.Addr()); !ok {
 			return true
 		}
 	}
@@ -178,37 +183,56 @@ func (e *userspaceEngine) trackOpenPostFilterOut(pp *packet.Parsed, t *tstun.Wra
 	return filter.Accept
 }
 
-func (e *userspaceEngine) onOpenTimeout(flow flowtrack.Tuple) {
-	e.mu.Lock()
-	of, ok := e.pendOpen[flow]
-	if !ok {
-		// Not a tracked flow, or already handled & deleted.
-		e.mu.Unlock()
-		return
-	}
-	delete(e.pendOpen, flow)
-	problem := of.problem
-	e.mu.Unlock()
+// openTimeoutDiag captures what [userspaceEngine.diagnoseOpenTimeout]
+// inferred about a pendopen flow that timed out. It is the input to
+// [classifyOpenTimeout].
+type openTimeoutDiag struct {
+	// problem is the TSMP reject reason previously reported by the peer
+	// via a MaybeBroken TSMP header, or zero if none.
+	problem packet.TailscaleRejectReason
+
+	// noPeer is true if PeerForIP did not find a peer for the flow.
+	noPeer bool
+	// peerUnreachable is true when we identified a Tailscale peer for
+	// the flow but it cannot currently be reached (pre-0.100 client,
+	// no HomeDERP, in-netmap-but-unknown-to-WireGuard, etc.).
+	peerUnreachable bool
+	// onlyZeroRoute is true if PeerForIP matched the peer only via a
+	// /0 route (likely a non-selected exit node). The outer code
+	// deliberately stays silent in this case; classification would be
+	// misleading.
+	onlyZeroRoute bool
+}
+
+// diagnoseOpenTimeout examines the engine state and logs a description
+// of why a pendopen flow timed out. It returns the populated
+// [openTimeoutDiag] so the caller can classify and (optionally) emit a
+// connreject event.
+func (e *userspaceEngine) diagnoseOpenTimeout(flow flowtrack.Tuple, problem packet.TailscaleRejectReason) openTimeoutDiag {
+	d := openTimeoutDiag{problem: problem}
 
 	if !problem.IsZero() {
 		e.logf("open-conn-track: timeout opening %v; peer reported problem: %v", flow, problem)
 	}
 
 	// Diagnose why it might've timed out.
-	pip, ok := e.PeerForIP(flow.DstAddr())
+	pip, ok := e.peerForIP(flow.DstAddr())
 	if !ok {
 		e.logf("open-conn-track: timeout opening %v; no associated peer node", flow)
-		return
+		d.noPeer = true
+		return d
 	}
 	n := pip.Node
 	if !n.IsWireGuardOnly() {
 		if n.DiscoKey().IsZero() {
 			e.logf("open-conn-track: timeout opening %v; peer node %v running pre-0.100", flow, n.Key().ShortString())
-			return
+			d.peerUnreachable = true
+			return d
 		}
 		if n.HomeDERP() == 0 {
 			e.logf("open-conn-track: timeout opening %v; peer node %v not connected to any DERP relay", flow, n.Key().ShortString())
-			return
+			d.peerUnreachable = true
+			return d
 		}
 	}
 
@@ -222,19 +246,19 @@ func (e *userspaceEngine) onOpenTimeout(flow flowtrack.Tuple) {
 			}
 		}
 		if onlyZeroRoute {
-			// This node was returned by peerForIP because
-			// its exit node /0 route(s) matched, but this
-			// might not be the exit node that's currently
-			// selected.  Rather than log misleading
-			// errors, just don't log at all for now.
-			// TODO(bradfitz): update this code to be
-			// exit-node-aware and make peerForIP return
-			// the node of the currently selected exit
-			// node.
-			return
+			// This node was returned by peerForIP because its exit
+			// node /0 route(s) matched, but this might not be the
+			// exit node that's currently selected. Rather than log
+			// misleading errors, just don't log at all for now.
+			// TODO(bradfitz): update this code to be exit-node-aware
+			// and make peerForIP return the node of the currently
+			// selected exit node.
+			d.onlyZeroRoute = true
+			return d
 		}
 		e.logf("open-conn-track: timeout opening %v; target node %v in netmap but unknown to WireGuard", flow, n.Key().ShortString())
-		return
+		d.peerUnreachable = true
+		return d
 	}
 
 	// TODO(bradfitz): figure out what PeerStatus.LastHandshake
@@ -262,6 +286,23 @@ func (e *userspaceEngine) onOpenTimeout(flow flowtrack.Tuple) {
 		flow, n.Key().ShortString(),
 		online,
 		e.magicConn.LastRecvActivityOfNodeKey(n.Key()))
+	return d
+}
+
+func (e *userspaceEngine) onOpenTimeout(flow flowtrack.Tuple) {
+	e.mu.Lock()
+	of, ok := e.pendOpen[flow]
+	if !ok {
+		// Not a tracked flow, or already handled & deleted.
+		e.mu.Unlock()
+		return
+	}
+	delete(e.pendOpen, flow)
+	problem := of.problem
+	e.mu.Unlock()
+
+	d := e.diagnoseOpenTimeout(flow, problem)
+	e.notifyConnRejectOpenTimeout(flow, d)
 }
 
 func durFmt(t time.Time) string {

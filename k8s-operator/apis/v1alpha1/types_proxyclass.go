@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 //go:build !plan9
@@ -352,12 +352,12 @@ type ServiceMonitor struct {
 
 type Labels map[string]LabelValue
 
-func (l Labels) Parse() map[string]string {
-	if l == nil {
+func (lb Labels) Parse() map[string]string {
+	if lb == nil {
 		return nil
 	}
-	m := make(map[string]string, len(l))
-	for k, v := range l {
+	m := make(map[string]string, len(lb))
+	for k, v := range lb {
 		m[k] = string(v)
 	}
 	return m

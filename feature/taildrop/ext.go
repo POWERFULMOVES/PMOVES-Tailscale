@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 package taildrop
@@ -9,7 +9,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"maps"
 	"path/filepath"
 	"runtime"
 	"slices"
@@ -19,10 +18,15 @@ import (
 
 	"tailscale.com/client/tailscale/apitype"
 	"tailscale.com/cmd/tailscaled/tailscaledhooks"
+	"tailscale.com/feature"
 	"tailscale.com/ipn"
 	"tailscale.com/ipn/ipnext"
+	"tailscale.com/ipn/ipnlocal"
 	"tailscale.com/ipn/ipnstate"
+	"tailscale.com/ipn/localapi"
 	"tailscale.com/tailcfg"
+	"tailscale.com/tailcfg/nodecap"
+	"tailscale.com/tailcfg/peercap"
 	"tailscale.com/tstime"
 	"tailscale.com/types/empty"
 	"tailscale.com/types/logger"
@@ -31,7 +35,14 @@ import (
 )
 
 func init() {
+	if !feature.Register("taildrop") {
+		return
+	}
 	ipnext.RegisterExtension("taildrop", newExtension)
+	ipnlocal.RegisterPeerAPIHandler("/v0/put/", handlePeerPut)
+	localapi.Register("file-put/", serveFilePut)
+	localapi.Register("files/", serveFiles)
+	localapi.Register("file-targets", serveFileTargets)
 
 	if runtime.GOOS == "windows" {
 		tailscaledhooks.UninstallSystemDaemonWindows.Add(func() {
@@ -125,7 +136,7 @@ func (e *Extension) onSelfChange(self tailcfg.NodeView) {
 	if self.Valid() {
 		e.selfUID = self.User()
 	}
-	e.capFileSharing = self.Valid() && self.CapMap().Contains(tailcfg.CapabilityFileSharing)
+	e.capFileSharing = self.Valid() && self.CapMap().Contains(nodecap.FileSharing)
 	osshare.SetFileSharingEnabled(e.capFileSharing, e.logf)
 }
 
@@ -139,8 +150,8 @@ func (e *Extension) onChangeProfile(profile ipn.LoginProfileView, _ ipn.PrefsVie
 	e.mu.Lock()
 	defer e.mu.Unlock()
 
-	uid := profile.UserProfile().ID
-	activeLogin := profile.UserProfile().LoginName
+	uid := profile.UserProfile().ID()
+	activeLogin := profile.UserProfile().LoginName()
 
 	if uid == 0 {
 		e.setMgrLocked(nil)
@@ -354,7 +365,7 @@ func (e *Extension) FileTargets() ([]*apitype.FileTarget, error) {
 		if self == p.User() {
 			return true
 		}
-		if nb.PeerHasCap(p, tailcfg.PeerCapabilityFileSharingTarget) {
+		if nb.PeerHasCap(p, peercap.FileSharingTarget) {
 			// Explicitly noted in the netmap ACL caps as a target.
 			return true
 		}
@@ -401,7 +412,7 @@ func (e *Extension) taildropTargetStatus(p tailcfg.NodeView, nb ipnext.NodeBacke
 	}
 	if selfUID != p.User() {
 		// Different user must have the explicit file sharing target capability
-		if !nb.PeerHasCap(p, tailcfg.PeerCapabilityFileSharingTarget) {
+		if !nb.PeerHasCap(p, peercap.FileSharingTarget) {
 			return ipnstate.TaildropTargetOwnedByOtherUser
 		}
 	}
@@ -411,14 +422,16 @@ func (e *Extension) taildropTargetStatus(p tailcfg.NodeView, nb ipnext.NodeBacke
 	return ipnstate.TaildropTargetAvailable
 }
 
-// updateOutgoingFiles updates b.outgoingFiles to reflect the given updates and
-// sends an ipn.Notify with the full list of outgoingFiles.
-func (e *Extension) updateOutgoingFiles(updates map[string]*ipn.OutgoingFile) {
+// updateOutgoingFiles merges updates into e.outgoingFiles and emits an
+// ipn.Notify.
+func (e *Extension) updateOutgoingFiles(updates map[string]ipn.OutgoingFile) {
 	e.mu.Lock()
 	if e.outgoingFiles == nil {
 		e.outgoingFiles = make(map[string]*ipn.OutgoingFile, len(updates))
 	}
-	maps.Copy(e.outgoingFiles, updates)
+	for id, f := range updates {
+		e.outgoingFiles[id] = &f
+	}
 	outgoingFiles := make([]*ipn.OutgoingFile, 0, len(e.outgoingFiles))
 	for _, file := range e.outgoingFiles {
 		outgoingFiles = append(outgoingFiles, file)

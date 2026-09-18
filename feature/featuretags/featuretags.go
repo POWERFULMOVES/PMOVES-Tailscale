@@ -1,7 +1,7 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
-// The featuretags package is a registry of all the ts_omit-able build tags.
+// Package featuretags is a registry of all the ts_omit-able build tags.
 package featuretags
 
 import "tailscale.com/util/set"
@@ -84,7 +84,7 @@ type FeatureMeta struct {
 	Deps []FeatureTag // other features this feature requires
 
 	// ImplementationDetail is whether the feature is an internal implementation
-	// detail. That is, it's not something a user wuold care about having or not
+	// detail. That is, it's not something a user would care about having or not
 	// having, but we'd like to able to omit from builds if no other
 	// user-visible features depend on it.
 	ImplementationDetail bool
@@ -93,8 +93,14 @@ type FeatureMeta struct {
 // Features are the known Tailscale features that can be selectively included or
 // excluded via build tags, and a description of each.
 var Features = map[FeatureTag]FeatureMeta{
-	"ace":           {Sym: "ACE", Desc: "Alternate Connectivity Endpoints"},
-	"acme":          {Sym: "ACME", Desc: "ACME TLS certificate management"},
+	"ace":  {Sym: "ACE", Desc: "Alternate Connectivity Endpoints"},
+	"acme": {Sym: "ACME", Desc: "ACME TLS certificate management"},
+	"androidbin": {
+		Sym:  "AndroidBin",
+		Desc: "Support for running raw (non-GUI app) binaries on Android: netmon interface discovery under the app sandbox",
+		Deps: []FeatureTag{"androiddns"},
+	},
+	"androiddns":    {Sym: "AndroidDNS", Desc: "DNS resolution via Android's dnsproxyd for standalone (non-app) binaries on Android"},
 	"appconnectors": {Sym: "AppConnectors", Desc: "App Connectors support"},
 	"aws":           {Sym: "AWS", Desc: "AWS integration"},
 	"advertiseexitnode": {
@@ -123,9 +129,14 @@ var Features = map[FeatureTag]FeatureMeta{
 		Desc:                 "Control-to-node (C2N) support",
 		ImplementationDetail: true,
 	},
+	"cachenetmap": {
+		Sym:  "CacheNetMap",
+		Desc: "Cache the netmap on disk between runs",
+	},
 	"captiveportal": {Sym: "CaptivePortal", Desc: "Captive portal detection"},
 	"capture":       {Sym: "Capture", Desc: "Packet capture"},
 	"cli":           {Sym: "CLI", Desc: "embed the CLI into the tailscaled binary"},
+	"colorable":     {Sym: "Colorable", Desc: "Colorized terminal output"},
 	"cliconndiag":   {Sym: "CLIConnDiag", Desc: "CLI connection error diagnostics"},
 	"clientmetrics": {Sym: "ClientMetrics", Desc: "Client metrics support"},
 	"clientupdate": {
@@ -134,7 +145,16 @@ var Features = map[FeatureTag]FeatureMeta{
 		Deps: []FeatureTag{"c2n"},
 	},
 	"completion": {Sym: "Completion", Desc: "CLI shell completion"},
-	"cloud":      {Sym: "Cloud", Desc: "detect cloud environment to learn instances IPs and DNS servers"},
+	"conn25":     {Sym: "Conn25", Desc: "Route traffic for configured domains through connector devices"},
+	"connreject": {
+		Sym:  "ConnReject",
+		Desc: "Connection-rejection diagnostics (TSMP rejects, pendopen timeouts) exposed over debug-rejects LocalAPI and c2n endpoints",
+	},
+	"completion_scripts": {
+		Sym: "CompletionScripts", Desc: "embed CLI shell completion scripts",
+		Deps: []FeatureTag{"completion"},
+	},
+	"cloud": {Sym: "Cloud", Desc: "detect cloud environment to learn instances IPs and DNS servers"},
 	"dbus": {
 		Sym:                  "DBus",
 		Desc:                 "Linux DBus support",
@@ -148,8 +168,10 @@ var Features = map[FeatureTag]FeatureMeta{
 		Deps: []FeatureTag{"portmapper"},
 	},
 	"desktop_sessions": {Sym: "DesktopSessions", Desc: "Desktop sessions support"},
+	"dnsresolvecache":  {Sym: "DNSResolveCache", Desc: "Persist successful DNS resolutions to disk for use on later boots with broken DNS"},
 	"doctor":           {Sym: "Doctor", Desc: "Diagnose possible issues with Tailscale and its host environment"},
 	"drive":            {Sym: "Drive", Desc: "Tailscale Drive (file server) support"},
+	"flashappliance":   {Sym: "FlashAppliance", Desc: "'tailscale configure flash-appliance' and 'pve-appliance' CLI commands for deploying Tailscale appliance images"},
 	"gro": {
 		Sym:  "GRO",
 		Desc: "Generic Receive Offload support (performance)",
@@ -158,9 +180,9 @@ var Features = map[FeatureTag]FeatureMeta{
 	"health":             {Sym: "Health", Desc: "Health checking support"},
 	"hujsonconf":         {Sym: "HuJSONConf", Desc: "HuJSON config file support"},
 	"identityfederation": {Sym: "IdentityFederation", Desc: "Auth key generation via identity federation support"},
+	"ipnbus":             {Sym: "IPNBus", Desc: "IPN notification bus (watch-ipn-bus) support, used by GUIs, debugging, and nicer 'tailscale up' support"},
 	"iptables":           {Sym: "IPTables", Desc: "Linux iptables support"},
 	"kube":               {Sym: "Kube", Desc: "Kubernetes integration"},
-	"lazywg":             {Sym: "LazyWG", Desc: "Lazy WireGuard configuration for memory-constrained devices with large netmaps"},
 	"linuxdnsfight":      {Sym: "LinuxDNSFight", Desc: "Linux support for detecting DNS fights (inotify watching of /etc/resolv.conf)"},
 	"linkspeed": {
 		Sym:  "LinkSpeed",
@@ -218,11 +240,27 @@ var Features = map[FeatureTag]FeatureMeta{
 		Desc: "Linux NetworkManager integration",
 		Deps: []FeatureTag{"dbus"},
 	},
-	"relayserver": {Sym: "RelayServer", Desc: "Relay server"},
+	"serviceclientprefs": {Sym: "ServiceClientPrefs", Desc: "Desktop client service launch preferences"},
+	"favorites":          {Sym: "Favorites", Desc: "Locally-pinned favorite devices, exit nodes, and services"},
+	"qrcodes":            {Sym: "QRCodes", Desc: "QR codes in tailscale CLI"},
+	"relayserver":        {Sym: "RelayServer", Desc: "Relay server"},
+	"remoteconfig": {
+		Sym:  "RemoteConfig",
+		Desc: "Full remote configuration of this node by the tailnet admin, opting out of Tailscale's per-feature double opt-in in favor of a single client-side trust decision",
+		Deps: []FeatureTag{"c2n"},
+	},
 	"resolved": {
 		Sym:  "Resolved",
 		Desc: "Linux systemd-resolved integration",
 		Deps: []FeatureTag{"dbus"},
+	},
+	"routecheck": {
+		Sym:  "RouteCheck",
+		Desc: "Support checking the reachability of overlapping routers, for choosing between multiple network paths to the same IP address",
+	},
+	"runtimemetrics": {
+		Sym:  "RuntimeMetrics",
+		Desc: "Support emission of runtime/metrics as clientmetrics",
 	},
 	"sdnotify": {
 		Sym:  "SDNotify",
@@ -242,11 +280,15 @@ var Features = map[FeatureTag]FeatureMeta{
 		Sym:  "Synology",
 		Desc: "Synology NAS integration (applies to Linux builds only)",
 	},
+	"syslog": {
+		Sym:  "Syslog",
+		Desc: "tailscaled --syslog flag support to send logs to the system syslog daemon",
+	},
 	"syspolicy": {Sym: "SystemPolicy", Desc: "System policy configuration (MDM) support"},
 	"systray": {
 		Sym:  "SysTray",
 		Desc: "Linux system tray",
-		Deps: []FeatureTag{"dbus"},
+		Deps: []FeatureTag{"dbus", "webbrowser"},
 	},
 	"taildrop": {
 		Sym:  "Taildrop",
@@ -258,6 +300,7 @@ var Features = map[FeatureTag]FeatureMeta{
 	"tailnetlock": {Sym: "TailnetLock", Desc: "Tailnet Lock support"},
 	"tap":         {Sym: "Tap", Desc: "Experimental Layer 2 (ethernet) support"},
 	"tpm":         {Sym: "TPM", Desc: "TPM support"},
+	"tundevstats": {Sym: "TUNDevStats", Desc: "Poll TUN device statistics (Linux only)"},
 	"unixsocketidentity": {
 		Sym:  "UnixSocketIdentity",
 		Desc: "differentiate between users accessing the LocalAPI over unix sockets (if omitted, all users have full access)",
@@ -280,6 +323,10 @@ var Features = map[FeatureTag]FeatureMeta{
 		Desc: "Usermetrics (documented, stable) metrics support",
 	},
 	"wakeonlan": {Sym: "WakeOnLAN", Desc: "Wake-on-LAN support"},
+	"webbrowser": {
+		Sym:  "WebBrowser",
+		Desc: "Open URLs in the user's web browser",
+	},
 	"webclient": {
 		Sym: "WebClient", Desc: "Web client support",
 		Deps: []FeatureTag{"serve"},

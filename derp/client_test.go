@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 package derp
@@ -6,13 +6,14 @@ package derp
 import (
 	"bufio"
 	"bytes"
-	"io"
 	"net"
+	"net/netip"
 	"reflect"
 	"sync"
 	"testing"
 	"time"
 
+	"go4.org/mem"
 	"tailscale.com/tstest"
 	"tailscale.com/types/key"
 )
@@ -92,6 +93,99 @@ func TestClientRecv(t *testing.T) {
 	}
 }
 
+// TestClientRecvPeerPresent tests that the client can parse peerPresent
+// frames from servers of various eras: old servers that send fewer fields
+// than the client knows about, and newer servers that send trailing fields
+// the client doesn't know about, which it must ignore. This matters during
+// rollouts of new DERP servers, when a region's meshed nodes and watchers
+// run a mix of versions.
+func TestClientRecvPeerPresent(t *testing.T) {
+	keyb := bytes.Repeat([]byte{1}, KeyLen)
+	k := key.NodePublicFromRaw32(mem.B(keyb))
+	ipPort := []byte{
+		0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, 1, 2, 3, 4, // ::ffff:1.2.3.4
+		0x12, 0x34, // port 4660
+	}
+	wantIPPort := netip.MustParseAddrPort("1.2.3.4:4660")
+
+	frame := func(fields ...[]byte) []byte {
+		b := []byte{byte(FramePeerPresent), 0, 0, 0, 0}
+		for _, f := range fields {
+			b = append(b, f...)
+		}
+		b[4] = byte(len(b) - FrameHeaderLen)
+		return b
+	}
+
+	tests := []struct {
+		name  string
+		input []byte
+		want  PeerPresentMessage
+	}{
+		{
+			name:  "key_only_from_ancient_server",
+			input: frame(keyb),
+			want:  PeerPresentMessage{Key: k},
+		},
+		{
+			name:  "ip_port_from_old_server",
+			input: frame(keyb, ipPort),
+			want:  PeerPresentMessage{Key: k, IPPort: wantIPPort},
+		},
+		{
+			name:  "flags_from_current_server",
+			input: frame(keyb, ipPort, []byte{PeerPresentIsRegular}),
+			want:  PeerPresentMessage{Key: k, IPPort: wantIPPort, Flags: PeerPresentIsRegular},
+		},
+		{
+			name:  "app_name_from_current_server",
+			input: frame(keyb, ipPort, []byte{PeerPresentIsRegular}, []byte{3, 'a', 'b', 'c'}),
+			want:  PeerPresentMessage{Key: k, IPPort: wantIPPort, Flags: PeerPresentIsRegular, AppName: "abc"},
+		},
+		{
+			name: "extra_fields_from_newer_server",
+			// A hypothetical newer server sending fields this client
+			// doesn't know about. They must be ignored.
+			input: frame(keyb, ipPort, []byte{PeerPresentIsRegular},
+				[]byte{3, 'a', 'b', 'c'}, []byte{0xde, 0xad}),
+			want: PeerPresentMessage{Key: k, IPPort: wantIPPort, Flags: PeerPresentIsRegular, AppName: "abc"},
+		},
+		{
+			name: "truncated_app_name_ignored",
+			// A buggy or malicious server sending an app name length
+			// that exceeds the frame.
+			input: frame(keyb, ipPort, []byte{PeerPresentIsRegular}, []byte{200, 'a', 'b', 'c'}),
+			want:  PeerPresentMessage{Key: k, IPPort: wantIPPort, Flags: PeerPresentIsRegular},
+		},
+		{
+			name:  "invalid_app_name_ignored",
+			input: frame(keyb, ipPort, []byte{PeerPresentIsRegular}, []byte{3, 0x01, 0x02, 0x03}),
+			want:  PeerPresentMessage{Key: k, IPPort: wantIPPort, Flags: PeerPresentIsRegular},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			c := &Client{
+				nc:    dummyNetConn{},
+				br:    bufio.NewReader(bytes.NewReader(tt.input)),
+				logf:  t.Logf,
+				clock: &tstest.Clock{},
+			}
+			m, err := c.Recv()
+			if err != nil {
+				t.Fatal(err)
+			}
+			got, ok := m.(PeerPresentMessage)
+			if !ok {
+				t.Fatalf("message type = %T; want PeerPresentMessage", m)
+			}
+			if got != tt.want {
+				t.Errorf("got %+v; want %+v", got, tt.want)
+			}
+		})
+	}
+}
+
 func TestClientSendPing(t *testing.T) {
 	var buf bytes.Buffer
 	c := &Client{
@@ -123,36 +217,6 @@ func TestClientSendPong(t *testing.T) {
 	}
 	if !bytes.Equal(buf.Bytes(), want) {
 		t.Errorf("unexpected output\nwrote: % 02x\n want: % 02x", buf.Bytes(), want)
-	}
-}
-
-func BenchmarkWriteUint32(b *testing.B) {
-	w := bufio.NewWriter(io.Discard)
-	b.ReportAllocs()
-	b.ResetTimer()
-	for range b.N {
-		writeUint32(w, 0x0ba3a)
-	}
-}
-
-type nopRead struct{}
-
-func (r nopRead) Read(p []byte) (int, error) {
-	return len(p), nil
-}
-
-var sinkU32 uint32
-
-func BenchmarkReadUint32(b *testing.B) {
-	r := bufio.NewReader(nopRead{})
-	var err error
-	b.ReportAllocs()
-	b.ResetTimer()
-	for range b.N {
-		sinkU32, err = readUint32(r)
-		if err != nil {
-			b.Fatal(err)
-		}
 	}
 }
 

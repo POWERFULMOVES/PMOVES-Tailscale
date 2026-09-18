@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 // Package opt defines optional types.
@@ -13,7 +13,7 @@ import (
 // is either "true", "false", or the empty string to mean unset.
 //
 // As a special case, the underlying string may also be the string
-// "unset" as as a synonym for the empty string. This lets the
+// "unset" as a synonym for the empty string. This lets the
 // explicit unset value be exchanged over an encoding/json "omitempty"
 // field without it being dropped.
 type Bool string
@@ -80,6 +80,17 @@ func (b *Bool) Scan(src any) error {
 		return nil
 	default:
 		return fmt.Errorf("opt.Bool.Scan: invalid type %T: %v", src, src)
+	}
+}
+
+// Normalized returns the normalized form of b, mapping "unset" to ""
+// and leaving other values unchanged.
+func (b Bool) Normalized() Bool {
+	switch b {
+	case ExplicitlyUnset:
+		return Empty
+	default:
+		return b
 	}
 }
 

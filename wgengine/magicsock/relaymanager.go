@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 package magicsock
@@ -9,12 +9,14 @@ import (
 	"fmt"
 	"net/netip"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"tailscale.com/disco"
 	"tailscale.com/net/packet"
 	"tailscale.com/net/stun"
 	udprelay "tailscale.com/net/udprelay/endpoint"
+	"tailscale.com/syncs"
 	"tailscale.com/tailcfg"
 	"tailscale.com/tstime"
 	"tailscale.com/types/key"
@@ -32,6 +34,14 @@ import (
 // acquire them.
 type relayManager struct {
 	initOnce sync.Once
+
+	// hasPeerRelayServers is whether relayManager is configured with at
+	// least one peer relay server via [relayManager.handleRelayServersSet]
+	// (or per-peer variants). Exposed as an atomic so [endpoint] hot paths
+	// can short-circuit when there are no relay servers without taking any
+	// lock or entering the run loop. Written only from runLoop() via
+	// [relayManager.publishHasServersRunLoop].
+	hasPeerRelayServers atomic.Bool
 
 	// ===================================================================
 	// The following fields are owned by a single goroutine, runLoop().
@@ -55,10 +65,12 @@ type relayManager struct {
 	newServerEndpointCh chan newRelayServerEndpointEvent
 	rxDiscoMsgCh        chan relayDiscoMsgEvent
 	serversCh           chan set.Set[candidatePeerRelay]
+	serverUpsertCh      chan candidatePeerRelay
+	serverRemoveCh      chan key.NodePublic
 	getServersCh        chan chan set.Set[candidatePeerRelay]
 	derpHomeChangeCh    chan derpHomeChangeEvent
 
-	discoInfoMu            sync.Mutex // guards the following field
+	discoInfoMu            syncs.Mutex // guards the following field
 	discoInfoByServerDisco map[key.DiscoPublic]*relayHandshakeDiscoInfo
 
 	// runLoopStoppedCh is written to by runLoop() upon return, enabling event
@@ -227,6 +239,16 @@ func (r *relayManager) runLoop() {
 			if !r.hasActiveWorkRunLoop() {
 				return
 			}
+		case upsert := <-r.serverUpsertCh:
+			r.handleServerUpsertRunLoop(upsert)
+			if !r.hasActiveWorkRunLoop() {
+				return
+			}
+		case nk := <-r.serverRemoveCh:
+			r.handleServerRemoveRunLoop(nk)
+			if !r.hasActiveWorkRunLoop() {
+				return
+			}
 		case getServersCh := <-r.getServersCh:
 			r.handleGetServersRunLoop(getServersCh)
 			if !r.hasActiveWorkRunLoop() {
@@ -264,6 +286,34 @@ func (r *relayManager) handleServersUpdateRunLoop(update set.Set[candidatePeerRe
 	for _, v := range update.Slice() {
 		r.serversByNodeKey[v.nodeKey] = v
 	}
+	r.publishHasServersRunLoop()
+}
+
+// handleServerUpsertRunLoop inserts or updates cp in serversByNodeKey. It is
+// the per-peer analog of [relayManager.handleServersUpdateRunLoop] used by
+// [Conn.UpsertPeer].
+func (r *relayManager) handleServerUpsertRunLoop(cp candidatePeerRelay) {
+	r.serversByNodeKey[cp.nodeKey] = cp
+	r.publishHasServersRunLoop()
+}
+
+// handleServerRemoveRunLoop deletes nk from serversByNodeKey. It is a no-op
+// if nk isn't currently a known server. It is the per-peer analog of
+// [relayManager.handleServersUpdateRunLoop] used by [Conn.RemovePeer] and by
+// [Conn.UpsertPeer] when a peer is upserted with fields that make it no
+// longer a relay candidate.
+func (r *relayManager) handleServerRemoveRunLoop(nk key.NodePublic) {
+	if _, ok := r.serversByNodeKey[nk]; !ok {
+		return
+	}
+	delete(r.serversByNodeKey, nk)
+	r.publishHasServersRunLoop()
+}
+
+// publishHasServersRunLoop updates [relayManager.hasPeerRelayServers] to
+// reflect whether any relay servers are currently known.
+func (r *relayManager) publishHasServersRunLoop() {
+	r.hasPeerRelayServers.Store(len(r.serversByNodeKey) > 0)
 }
 
 type relayDiscoMsgEvent struct {
@@ -329,6 +379,8 @@ func (r *relayManager) init() {
 		r.newServerEndpointCh = make(chan newRelayServerEndpointEvent)
 		r.rxDiscoMsgCh = make(chan relayDiscoMsgEvent)
 		r.serversCh = make(chan set.Set[candidatePeerRelay])
+		r.serverUpsertCh = make(chan candidatePeerRelay)
+		r.serverRemoveCh = make(chan key.NodePublic)
 		r.getServersCh = make(chan chan set.Set[candidatePeerRelay])
 		r.derpHomeChangeCh = make(chan derpHomeChangeEvent)
 		r.runLoopStoppedCh = make(chan struct{}, 1)
@@ -360,7 +412,7 @@ func (r *relayManager) ensureDiscoInfoFor(work *relayHandshakeWork) {
 		di.di = &discoInfo{
 			discoKey:   work.se.ServerDisco,
 			discoShort: work.se.ServerDisco.ShortString(),
-			sharedKey:  work.wlb.ep.c.discoPrivate.Shared(work.se.ServerDisco),
+			sharedKey:  work.wlb.ep.c.discoAtomic.Private().Shared(work.se.ServerDisco),
 		}
 	}
 }
@@ -433,6 +485,21 @@ func (r *relayManager) handleRxDiscoMsg(conn *Conn, dm disco.Message, relayServe
 // handleRelayServersSet handles an update of the complete relay server set.
 func (r *relayManager) handleRelayServersSet(servers set.Set[candidatePeerRelay]) {
 	relayManagerInputEvent(r, nil, &r.serversCh, servers)
+}
+
+// handleRelayServerUpsert is the O(1) per-peer variant of
+// [relayManager.handleRelayServersSet]: it inserts or updates a single
+// relay server entry.
+func (r *relayManager) handleRelayServerUpsert(cp candidatePeerRelay) {
+	relayManagerInputEvent(r, nil, &r.serverUpsertCh, cp)
+}
+
+// handleRelayServerRemove is the O(1) per-peer variant of
+// [relayManager.handleRelayServersSet]: it removes a single relay server
+// entry by node key. It is a no-op if nk is not currently a known relay
+// server.
+func (r *relayManager) handleRelayServerRemove(nk key.NodePublic) {
+	relayManagerInputEvent(r, nil, &r.serverRemoveCh, nk)
 }
 
 // relayManagerInputEvent initializes [relayManager] if necessary, starts
@@ -678,6 +745,17 @@ func (r *relayManager) handleHandshakeWorkDoneRunLoop(done relayEndpointHandshak
 }
 
 func (r *relayManager) handleNewServerEndpointRunLoop(newServerEndpoint newRelayServerEndpointEvent) {
+	if newServerEndpoint.se.ServerDisco.IsZero() {
+		// A relay server always has a nonzero disco key, so this endpoint is
+		// malformed or malicious. It may come from a [disco.CallMeMaybeVia]
+		// with a zeroed ServerDisco, including one carrying an unknown
+		// message version, which parses to a zero-valued message. Dropping it
+		// here prevents a panic in [relayManager.ensureDiscoInfoFor], whose
+		// DiscoPrivate.Shared call rejects zero keys.
+		newServerEndpoint.wlb.ep.c.logf("magicsock: relayManager: ignoring relay server endpoint with zero ServerDisco")
+		return
+	}
+
 	// Check for duplicate work by server disco + VNI.
 	sdv := serverDiscoVNI{newServerEndpoint.se.ServerDisco, newServerEndpoint.se.VNI}
 	existingWork, ok := r.handshakeWorkByServerDiscoVNI[sdv]
@@ -723,8 +801,10 @@ func (r *relayManager) handleNewServerEndpointRunLoop(newServerEndpoint newRelay
 		go r.sendCallMeMaybeVia(newServerEndpoint.wlb.ep, newServerEndpoint.se)
 	}
 
-	lastBestMatchingServer := newServerEndpoint.se.ServerDisco.Compare(newServerEndpoint.wlb.lastBest.relayServerDisco) == 0
-	if lastBestMatchingServer && newServerEndpoint.wlb.lastBestIsTrusted {
+	lastBestMatchingServerVNI := newServerEndpoint.wlb.lastBest.vni.IsSet() &&
+		newServerEndpoint.se.ServerDisco.Compare(newServerEndpoint.wlb.lastBest.relayServerDisco) == 0 &&
+		newServerEndpoint.se.VNI == newServerEndpoint.wlb.lastBest.vni.Get()
+	if lastBestMatchingServerVNI && newServerEndpoint.wlb.lastBestIsTrusted {
 		// This relay server endpoint is the same as [endpoint]'s bestAddr at
 		// the time UDP relay path discovery was started, and it was also a
 		// trusted path (see endpoint.trustBestAddrUntil), so return early.
@@ -800,7 +880,7 @@ func (r *relayManager) sendCallMeMaybeVia(ep *endpoint, se udprelay.ServerEndpoi
 			AddrPorts:           se.AddrPorts,
 		},
 	}
-	ep.c.sendDiscoMessage(epAddr{ap: derpAddr}, ep.publicKey, epDisco.key, callMeMaybeVia, discoVerboseLog)
+	ep.c.sendDiscoMessage(epAddr{ap: derpAddr}, ep.publicKey, epDisco.key(), callMeMaybeVia, discoVerboseLog)
 }
 
 func (r *relayManager) handshakeServerEndpoint(work *relayHandshakeWork) {
@@ -823,7 +903,7 @@ func (r *relayManager) handshakeServerEndpoint(work *relayHandshakeWork) {
 	common := disco.BindUDPRelayEndpointCommon{
 		VNI:        work.se.VNI,
 		Generation: work.handshakeGen,
-		RemoteKey:  epDisco.key,
+		RemoteKey:  epDisco.key(),
 	}
 
 	work.dlogf("[v1] magicsock: relayManager: starting handshake addrPorts=%v",
@@ -877,7 +957,7 @@ func (r *relayManager) handshakeServerEndpoint(work *relayHandshakeWork) {
 				answer.Challenge = *withAnswer
 				ep.c.sendDiscoMessage(epAddr{ap: to, vni: vni}, key.NodePublic{}, work.se.ServerDisco, answer, discoVerboseLog)
 			}
-			ep.c.sendDiscoMessage(epAddr{ap: to, vni: vni}, key.NodePublic{}, epDisco.key, ping, discoVerboseLog)
+			ep.c.sendDiscoMessage(epAddr{ap: to, vni: vni}, key.NodePublic{}, epDisco.key(), ping, discoVerboseLog)
 		}()
 	}
 
@@ -885,7 +965,7 @@ func (r *relayManager) handshakeServerEndpoint(work *relayHandshakeWork) {
 		if common.VNI != work.se.VNI {
 			return errors.New("mismatching VNI")
 		}
-		if common.RemoteKey.Compare(epDisco.key) != 0 {
+		if common.RemoteKey.Compare(epDisco.key()) != 0 {
 			return errors.New("mismatching RemoteKey")
 		}
 		return nil
@@ -1030,7 +1110,7 @@ func (r *relayManager) allocateAllServersRunLoop(wlb endpointWithLastBest) {
 	if remoteDisco == nil {
 		return
 	}
-	discoKeys := key.NewSortedPairOfDiscoPublic(wlb.ep.c.discoPublic, remoteDisco.key)
+	discoKeys := key.NewSortedPairOfDiscoPublic(wlb.ep.c.discoAtomic.Public(), remoteDisco.key())
 	for _, v := range r.serversByNodeKey {
 		byDiscoKeys, ok := r.allocWorkByDiscoKeysByServerNodeKey[v.nodeKey]
 		if !ok {

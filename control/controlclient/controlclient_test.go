@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 package controlclient
@@ -15,7 +15,6 @@ import (
 	"net/netip"
 	"net/url"
 	"reflect"
-	"slices"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -39,8 +38,8 @@ import (
 )
 
 func fieldsOf(t reflect.Type) (fields []string) {
-	for i := range t.NumField() {
-		if name := t.Field(i).Name; name != "_" {
+	for field := range t.Fields() {
+		if name := field.Name; name != "_" {
 			fields = append(fields, name)
 		}
 	}
@@ -49,7 +48,7 @@ func fieldsOf(t reflect.Type) (fields []string) {
 
 func TestStatusEqual(t *testing.T) {
 	// Verify that the Equal method stays in sync with reality
-	equalHandles := []string{"Err", "URL", "NetMap", "Persist", "state"}
+	equalHandles := []string{"Err", "URL", "LoggedIn", "InMapPoll", "NetMap", "Persist"}
 	if have := fieldsOf(reflect.TypeFor[Status]()); !reflect.DeepEqual(have, equalHandles) {
 		t.Errorf("Status.Equal check might be out of sync\nfields: %q\nhandled: %q\n",
 			have, equalHandles)
@@ -81,7 +80,7 @@ func TestStatusEqual(t *testing.T) {
 		},
 		{
 			&Status{},
-			&Status{state: StateAuthenticated},
+			&Status{LoggedIn: true, Persist: new(persist.Persist).View()},
 			false,
 		},
 	}
@@ -99,6 +98,7 @@ func TestCanSkipStatus(t *testing.T) {
 	nm1 := &netmap.NetworkMap{}
 	nm2 := &netmap.NetworkMap{}
 
+	commonPersist := new(persist.Persist).View()
 	tests := []struct {
 		name   string
 		s1, s2 *Status
@@ -135,8 +135,20 @@ func TestCanSkipStatus(t *testing.T) {
 			want: false,
 		},
 		{
-			name: "s1-state-diff",
-			s1:   &Status{state: 123, NetMap: nm1},
+			name: "s1-login-finished-diff",
+			s1:   &Status{LoggedIn: true, Persist: new(persist.Persist).View(), NetMap: nm1},
+			s2:   &Status{NetMap: nm2},
+			want: false,
+		},
+		{
+			name: "s1-login-finished",
+			s1:   &Status{LoggedIn: true, Persist: new(persist.Persist).View(), NetMap: nm1},
+			s2:   &Status{NetMap: nm2},
+			want: false,
+		},
+		{
+			name: "s1-synced-diff",
+			s1:   &Status{InMapPoll: true, LoggedIn: true, Persist: new(persist.Persist).View(), NetMap: nm1},
 			s2:   &Status{NetMap: nm2},
 			want: false,
 		},
@@ -154,8 +166,8 @@ func TestCanSkipStatus(t *testing.T) {
 		},
 		{
 			name: "skip",
-			s1:   &Status{NetMap: nm1},
-			s2:   &Status{NetMap: nm2},
+			s1:   &Status{NetMap: nm1, LoggedIn: true, InMapPoll: true, Persist: commonPersist},
+			s2:   &Status{NetMap: nm2, LoggedIn: true, InMapPoll: true, Persist: commonPersist},
 			want: true,
 		},
 	}
@@ -167,10 +179,11 @@ func TestCanSkipStatus(t *testing.T) {
 		})
 	}
 
-	want := []string{"Err", "URL", "NetMap", "Persist", "state"}
-	if f := fieldsOf(reflect.TypeFor[Status]()); !slices.Equal(f, want) {
-		t.Errorf("Status fields = %q; this code was only written to handle fields %q", f, want)
+	coveredFields := []string{"Err", "URL", "LoggedIn", "InMapPoll", "NetMap", "Persist"}
+	if have := fieldsOf(reflect.TypeFor[Status]()); !reflect.DeepEqual(have, coveredFields) {
+		t.Errorf("Status fields = %q; this code was only written to handle fields %q", have, coveredFields)
 	}
+
 }
 
 func TestRetryableErrors(t *testing.T) {
@@ -184,7 +197,7 @@ func TestRetryableErrors(t *testing.T) {
 		{fmt.Errorf("%w: %w", errHTTPPostFailure, errors.New("bad post")), true},
 		{fmt.Errorf("%w: %w", errNoNodeKey, errors.New("not node key")), true},
 		{errBadHTTPResponse(429, "too may requests"), true},
-		{errBadHTTPResponse(500, "internal server eror"), true},
+		{errBadHTTPResponse(500, "internal server error"), true},
 		{errBadHTTPResponse(502, "bad gateway"), true},
 		{errBadHTTPResponse(503, "service unavailable"), true},
 		{errBadHTTPResponse(504, "gateway timeout"), true},
@@ -201,12 +214,12 @@ func TestRetryableErrors(t *testing.T) {
 }
 
 type retryableForTest interface {
+	error
 	Retryable() bool
 }
 
 func isRetryableErrorForTest(err error) bool {
-	var ae retryableForTest
-	if errors.As(err, &ae) {
+	if ae, ok := errors.AsType[retryableForTest](err); ok {
 		return ae.Retryable()
 	}
 	return false
@@ -390,6 +403,195 @@ func testHTTPS(t *testing.T, withProxy bool) {
 		if got, want := proxyReqs.Load(), int64(1); got != want {
 			t.Errorf("proxy CONNECT requests = %d; want %d", got, want)
 		}
+	}
+}
+
+// newDirectForTestControl serves control and returns a direct client wired to
+// reach it.
+func newDirectForTestControl(t testing.TB, tc *testcontrol.Server) *Direct {
+	t.Helper()
+	bakedroots.ResetForTest(t, tlstest.TestRootCA())
+
+	bus := eventbustest.NewBus(t)
+
+	controlLn, err := tls.Listen("tcp", "127.0.0.1:0", tlstest.ControlPlane.ServerTLSConfig())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { controlLn.Close() })
+
+	if tc.Logf == nil {
+		tc.Logf = tstest.WhileTestRunningLogger(t)
+	}
+	controlSrv := &http.Server{
+		Handler:  tc,
+		ErrorLog: logger.StdLogger(t.Logf),
+	}
+	go controlSrv.Serve(controlLn)
+
+	const fakeControlIP = "1.2.3.4"
+
+	dialer := &tsdial.Dialer{}
+	dialer.SetNetMon(netmon.NewStatic())
+	dialer.SetBus(bus)
+	dialer.SetSystemDialerForTest(func(ctx context.Context, network, addr string) (net.Conn, error) {
+		host, _, err := net.SplitHostPort(addr)
+		if err != nil {
+			return nil, fmt.Errorf("SplitHostPort(%q): %v", addr, err)
+		}
+		var d net.Dialer
+		if host == fakeControlIP {
+			return d.DialContext(ctx, network, controlLn.Addr().String())
+		}
+		return nil, fmt.Errorf("unexpected dial to %q", addr)
+	})
+
+	opts := Options{
+		Persist: persist.Persist{},
+		GetMachinePrivateKey: func() (key.MachinePrivate, error) {
+			return key.NewMachine(), nil
+		},
+		ServerURL: "https://controlplane.tstest",
+		Clock:     tstime.StdClock{},
+		Hostinfo: &tailcfg.Hostinfo{
+			BackendLogID: "test-backend-log-id",
+		},
+		DiscoPublicKey: key.NewDisco().Public(),
+		Logf:           t.Logf,
+		HealthTracker:  health.NewTracker(bus),
+		PopBrowserURL: func(url string) {
+			t.Logf("PopBrowserURL: %q", url)
+		},
+		Dialer: dialer,
+		Bus:    bus,
+	}
+	d, err := NewDirect(opts)
+	if err != nil {
+		t.Fatalf("NewDirect: %v", err)
+	}
+	t.Cleanup(func() { d.Close() })
+
+	d.dnsCache.LookupIPForTest = func(ctx context.Context, host string) ([]netip.Addr, error) {
+		if host == "controlplane.tstest" {
+			return []netip.Addr{netip.MustParseAddr(fakeControlIP)}, nil
+		}
+		t.Errorf("unexpected DNS query for %q", host)
+		return nil, fmt.Errorf("unexpected DNS lookup for %q", host)
+	}
+	return d
+}
+
+// TestRegisterRateLimited verifies that the client correctly handles 429
+// responses to registration requests by parsing the Retry-After header
+// and returning a [rateLimitError].
+func TestRegisterRateLimited(t *testing.T) {
+	var registerAttempts atomic.Int64
+	d := newDirectForTestControl(t, &testcontrol.Server{
+		MaybeRejectRequest: testcontrol.RejectRequestForPath("/machine/register", func() (int, string, string) {
+			if registerAttempts.Add(1) == 1 {
+				return http.StatusTooManyRequests, "30", "try again later"
+			}
+			return 0, "", ""
+		}),
+	})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	// First attempt should get a 429 and return a rateLimitError.
+	_, err := d.TryLogin(ctx, LoginEphemeral)
+	if err == nil {
+		t.Fatal("expected rate limit error on first attempt, got nil")
+	}
+	var rle *rateLimitError
+	if !errors.As(err, &rle) {
+		t.Fatalf("expected *rateLimitError, got %T: %v", err, err)
+	}
+	if rle.retryAfter != 30*time.Second {
+		t.Errorf("retryAfter; got = %v, want 30s", rle.retryAfter)
+	}
+	if rle.msg != "try again later" {
+		t.Errorf("msg; got = %q, want %q", rle.msg, "try again later")
+	}
+
+	// Second attempt should succeed (server no longer rate-limiting).
+	url, err := d.TryLogin(ctx, LoginEphemeral)
+	if err != nil {
+		t.Fatalf("TryLogin after rate limit: %v", err)
+	}
+	if url != "" {
+		t.Errorf("got URL %q, want empty", url)
+	}
+
+	if got := registerAttempts.Load(); got != 2 {
+		t.Errorf("register attempts; got = %d, want 2", got)
+	}
+}
+
+// TestMapRequestRateLimited verifies that the client turns 429 and 503
+// responses to map requests into a [rateLimitError] carrying the server's
+// Retry-After value, and that other failures don't.
+func TestMapRequestRateLimited(t *testing.T) {
+	tests := []struct {
+		name           string
+		status         int
+		retryAfter     string
+		wantRateLimit  bool
+		wantRetryAfter time.Duration
+	}{
+		{name: "429-with-header", status: 429, retryAfter: "30", wantRateLimit: true, wantRetryAfter: 30 * time.Second},
+		{name: "503-with-header", status: 503, retryAfter: "45", wantRateLimit: true, wantRetryAfter: 45 * time.Second},
+		{name: "503-no-header", status: 503, wantRateLimit: false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var mapAttempts atomic.Int64
+			d := newDirectForTestControl(t, &testcontrol.Server{
+				MaybeRejectRequest: testcontrol.RejectRequestForPath("/machine/map", func() (int, string, string) {
+					if mapAttempts.Add(1) == 1 {
+						return tt.status, tt.retryAfter, "slow down"
+					}
+					return 0, "", ""
+				}),
+			})
+
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+
+			if _, err := d.TryLogin(ctx, LoginEphemeral); err != nil {
+				t.Fatalf("TryLogin: %v", err)
+			}
+
+			// First attempt is rejected.
+			_, err := d.FetchNetMapForTest(ctx)
+			if err == nil {
+				t.Fatal("expected error on first map request, got nil")
+			}
+			rle, ok := errors.AsType[*rateLimitError](err)
+			if ok != tt.wantRateLimit {
+				t.Fatalf("got *rateLimitError = %v, want %v; err = %v", ok, tt.wantRateLimit, err)
+			}
+			if ok {
+				if rle.retryAfter != tt.wantRetryAfter {
+					t.Errorf("retryAfter = %v, want %v", rle.retryAfter, tt.wantRetryAfter)
+				}
+				if rle.msg != "slow down" {
+					t.Errorf("msg = %q, want %q", rle.msg, "slow down")
+				}
+			}
+
+			// Second attempt should succeed (server no longer rejecting).
+			nm, err := d.FetchNetMapForTest(ctx)
+			if err != nil {
+				t.Fatalf("FetchNetMapForTest after rejection: %v", err)
+			}
+			if nm == nil {
+				t.Fatal("got nil netmap")
+			}
+			if got := mapAttempts.Load(); got != 2 {
+				t.Errorf("map attempts = %d, want 2", got)
+			}
+		})
 	}
 }
 

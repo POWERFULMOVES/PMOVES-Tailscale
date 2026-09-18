@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 // Package clientupdate enables the client update feature.
@@ -36,6 +36,9 @@ import (
 )
 
 func init() {
+	if !feature.Register("clientupdate") {
+		return
+	}
 	ipnext.RegisterExtension("clientupdate", newExt)
 
 	// C2N
@@ -163,6 +166,7 @@ func (e *extension) DoSelfUpdate() {
 	})
 	if err != nil {
 		e.pushSelfUpdateProgress(ipnstate.NewUpdateProgress(ipnstate.UpdateFailed, err.Error()))
+		return
 	}
 	err = up.Update()
 	if err != nil {
@@ -178,6 +182,10 @@ func (e *extension) DoSelfUpdate() {
 // serveUpdateProgress after pinging this endpoint to check how the update is
 // going.
 func serveUpdateInstall(h *localapi.Handler, w http.ResponseWriter, r *http.Request) {
+	if !h.PermitWrite {
+		http.Error(w, "update access denied", http.StatusForbidden)
+		return
+	}
 	if r.Method != httpm.POST {
 		http.Error(w, "only POST allowed", http.StatusMethodNotAllowed)
 		return

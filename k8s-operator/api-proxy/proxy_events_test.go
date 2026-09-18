@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 //go:build !plan9
@@ -22,6 +22,7 @@ import (
 	"tailscale.com/net/netx"
 	"tailscale.com/sessionrecording"
 	"tailscale.com/tailcfg"
+	"tailscale.com/tailcfg/peercap"
 	"tailscale.com/tsnet"
 )
 
@@ -61,7 +62,6 @@ func TestRecordRequestAsEvent(t *testing.T) {
 		log:           zl.Sugar(),
 		ts:            &tsnet.Server{},
 		sendEventFunc: sender.Send,
-		eventsEnabled: true,
 	}
 
 	defaultWho := &apitype.WhoIsResponse{
@@ -74,9 +74,9 @@ func TestRecordRequestAsEvent(t *testing.T) {
 			LoginName: "user@example.com",
 		},
 		CapMap: tailcfg.PeerCapMap{
-			tailcfg.PeerCapabilityKubernetes: []tailcfg.RawMessage{
+			peercap.Kubernetes: []tailcfg.RawMessage{
 				tailcfg.RawMessage(`{"recorderAddrs":["127.0.0.1:1234"]}`),
-				tailcfg.RawMessage(`{"enforceRecorder": true}`),
+				tailcfg.RawMessage(`{"enforceRecorder": true, "enableEvents": true}`),
 			},
 		},
 	}
@@ -308,8 +308,9 @@ func TestRecordRequestAsEvent(t *testing.T) {
 				Node:        defaultWho.Node,
 				UserProfile: defaultWho.UserProfile,
 				CapMap: tailcfg.PeerCapMap{
-					tailcfg.PeerCapabilityKubernetes: []tailcfg.RawMessage{
+					peercap.Kubernetes: []tailcfg.RawMessage{
 						tailcfg.RawMessage(`{"recorderAddrs":["127.0.0.1:1234", "127.0.0.1:5678"]}`),
+						tailcfg.RawMessage(`{"enforceRecorder": true, "enableEvents": true}`),
 					},
 				},
 			},
@@ -398,6 +399,7 @@ func TestRecordRequestAsEvent(t *testing.T) {
 			},
 			setupSender:  func() { sender.Reset() },
 			wantNumCalls: 0,
+			wantErr:      true,
 		},
 		{
 			name: "error-sending",
@@ -510,8 +512,19 @@ func TestRecordRequestAsEvent(t *testing.T) {
 			tt.setupSender()
 
 			req := tt.req()
-			err := ap.recordRequestAsEvent(req, tt.who)
 
+			c, err := determineRecorderConfig(tt.who)
+			if err != nil {
+				t.Fatalf("error trying to determine whether the kubernetes api request %q needs to be recorded: %v", req.URL.String(), err)
+				return
+			}
+
+			if !c.enableEvents && tt.wantEvent != nil {
+				t.Errorf("expected event but events not enabled in CapMap. Want: %#v", tt.wantEvent)
+				return
+			}
+
+			err = ap.recordRequestAsEvent(req, tt.who, c.recorderAddresses, c.failOpen)
 			if (err != nil) != tt.wantErr {
 				t.Fatalf("recordRequestAsEvent() error = %v, wantErr %v", err, tt.wantErr)
 			}

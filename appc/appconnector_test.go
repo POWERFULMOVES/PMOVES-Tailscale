@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 package appc
@@ -251,6 +251,16 @@ func TestObserveDNSResponse(t *testing.T) {
 		}
 		a.Wait(ctx)
 		wantRoutes = append(wantRoutes, netip.MustParsePrefix("192.0.0.10/32"))
+		if got, want := rc.Routes(), wantRoutes; !slices.Equal(got, want) {
+			t.Errorf("got %v; want %v", got, want)
+		}
+
+		// a CNAME record chain with a cycle terminates and does not
+		// add any new routes.
+		if err := a.ObserveDNSResponse(dnsCNAMEResponse("192.0.0.11", "a.example.org.", "b.example.org.", "a.example.org.")); err != nil {
+			t.Errorf("ObserveDNSResponse: %v", err)
+		}
+		a.Wait(ctx)
 		if got, want := rc.Routes(), wantRoutes; !slices.Equal(got, want) {
 			t.Errorf("got %v; want %v", got, want)
 		}
@@ -698,7 +708,7 @@ func TestRateLogger(t *testing.T) {
 		wasCalled = true
 	})
 
-	for i := 0; i < 3; i++ {
+	for range 3 {
 		clock.Advance(1 * time.Millisecond)
 		rl.update(0)
 		if wasCalled {
@@ -720,7 +730,7 @@ func TestRateLogger(t *testing.T) {
 		wasCalled = true
 	})
 
-	for i := 0; i < 3; i++ {
+	for range 3 {
 		clock.Advance(1 * time.Minute)
 		rl.update(0)
 		if wasCalled {
@@ -736,6 +746,7 @@ func TestRateLogger(t *testing.T) {
 }
 
 func TestRouteStoreMetrics(t *testing.T) {
+	clientmetric.ResetForTest(t)
 	metricStoreRoutes(1, 1)
 	metricStoreRoutes(1, 1)         // the 1 buckets value should be 2
 	metricStoreRoutes(5, 5)         // the 5 buckets value should be 1

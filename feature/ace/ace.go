@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 // Package ace registers support for Alternate Connectivity Endpoints (ACE).
@@ -8,11 +8,15 @@ import (
 	"net/netip"
 
 	"tailscale.com/control/controlhttp"
+	"tailscale.com/feature"
 	"tailscale.com/net/ace"
 	"tailscale.com/net/netx"
 )
 
 func init() {
+	if !feature.Register("ace") {
+		return
+	}
 	controlhttp.HookMakeACEDialer.Set(mkDialer)
 }
 

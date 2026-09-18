@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 package taildrop
@@ -21,6 +21,7 @@ import (
 	"tailscale.com/client/tailscale/apitype"
 	"tailscale.com/ipn/ipnlocal"
 	"tailscale.com/tailcfg"
+	"tailscale.com/tailcfg/nodecap"
 	"tailscale.com/tstest"
 	"tailscale.com/tstime"
 	"tailscale.com/types/logger"
@@ -481,7 +482,7 @@ func TestHandlePeerAPI(t *testing.T) {
 				},
 			}
 			if tt.debugCap {
-				selfNode.CapMap = tailcfg.NodeCapMap{tailcfg.CapabilityDebug: nil}
+				selfNode.CapMap = tailcfg.NodeCapMap{nodecap.Debug: nil}
 			}
 			var rootDir string
 			var fo FileOps

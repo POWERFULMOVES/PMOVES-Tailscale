@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 package magicsock
@@ -42,7 +42,7 @@ func (c *Conn) ServeHTTPDebug(w http.ResponseWriter, r *http.Request) {
 	fmt.Fprintf(w, "<h2 id=derp><a href=#derp>#</a> DERP</h2><ul>")
 	if c.derpMap != nil {
 		type D struct {
-			regionID   int
+			regionID   tailcfg.DERPRegionID
 			lastWrite  time.Time
 			createTime time.Time
 		}
@@ -108,8 +108,8 @@ func (c *Conn) ServeHTTPDebug(w http.ResponseWriter, r *http.Request) {
 		}
 		sort.Slice(ent, func(i, j int) bool { return ent[i].pub.Less(ent[j].pub) })
 
-		peers := map[key.NodePublic]tailcfg.NodeView{}
-		for _, p := range c.peers.All() {
+		peers := make(map[key.NodePublic]tailcfg.NodeView, len(c.peersByID))
+		for _, p := range c.peersByID {
 			peers[p.Key()] = p
 		}
 

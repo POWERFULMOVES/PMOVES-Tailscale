@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 package controlclient
@@ -9,12 +9,15 @@ import (
 	"context"
 	"crypto"
 	"crypto/sha256"
+	"crypto/tls"
+	"crypto/x509"
 	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"log"
+	"math/rand/v2"
 	"net"
 	"net/http"
 	"net/netip"
@@ -22,8 +25,8 @@ import (
 	"reflect"
 	"runtime"
 	"slices"
+	"strconv"
 	"strings"
-	"sync"
 	"sync/atomic"
 	"time"
 
@@ -44,57 +47,63 @@ import (
 	"tailscale.com/net/netx"
 	"tailscale.com/net/tlsdial"
 	"tailscale.com/net/tsdial"
+	"tailscale.com/syncs"
 	"tailscale.com/tailcfg"
+	"tailscale.com/tailcfg/nodecap"
 	"tailscale.com/tka"
 	"tailscale.com/tstime"
 	"tailscale.com/types/key"
 	"tailscale.com/types/logger"
 	"tailscale.com/types/netmap"
 	"tailscale.com/types/persist"
-	"tailscale.com/types/ptr"
 	"tailscale.com/types/tkatype"
+	"tailscale.com/types/views"
 	"tailscale.com/util/clientmetric"
 	"tailscale.com/util/eventbus"
+	"tailscale.com/util/httpbody"
 	"tailscale.com/util/singleflight"
 	"tailscale.com/util/syspolicy/pkey"
 	"tailscale.com/util/syspolicy/policyclient"
 	"tailscale.com/util/testenv"
+	"tailscale.com/util/vizerror"
 	"tailscale.com/util/zstdframe"
+	"tailscale.com/wgengine/filter"
 )
 
 // Direct is the client that connects to a tailcontrol server for a node.
 type Direct struct {
-	httpc                 *http.Client // HTTP client used to do TLS requests to control (just https://controlplane.tailscale.com/key?v=123)
-	interceptedDial       *atomic.Bool // if non-nil, pointer to bool whether ScreenTime intercepted our dial
-	dialer                *tsdial.Dialer
-	dnsCache              *dnscache.Resolver
-	controlKnobs          *controlknobs.Knobs // always non-nil
-	serverURL             string              // URL of the tailcontrol server
-	clock                 tstime.Clock
-	logf                  logger.Logf
-	netMon                *netmon.Monitor // non-nil
-	health                *health.Tracker
-	discoPubKey           key.DiscoPublic
-	busClient             *eventbus.Client
-	clientVersionPub      *eventbus.Publisher[tailcfg.ClientVersion]
-	autoUpdatePub         *eventbus.Publisher[AutoUpdate]
-	controlTimePub        *eventbus.Publisher[ControlTime]
-	getMachinePrivKey     func() (key.MachinePrivate, error)
-	debugFlags            []string
-	skipIPForwardingCheck bool
-	pinger                Pinger
-	popBrowser            func(url string)    // or nil
-	polc                  policyclient.Client // always non-nil
-	c2nHandler            http.Handler        // or nil
-	panicOnUse            bool                // if true, panic if client is used (for testing)
-	closedCtx             context.Context     // alive until Direct.Close is called
-	closeCtx              context.CancelFunc  // cancels closedCtx
+	httpc             *http.Client // HTTP client used to do TLS requests to control (just https://controlplane.tailscale.com/key?v=123)
+	interceptedDial   *atomic.Bool // if non-nil, pointer to bool whether ScreenTime intercepted our dial
+	dialer            *tsdial.Dialer
+	dnsCache          *dnscache.Resolver
+	controlKnobs      *controlknobs.Knobs // always non-nil
+	serverURL         string              // URL of the tailcontrol server
+	clock             tstime.Clock
+	logf              logger.Logf
+	netMon            *netmon.Monitor // non-nil
+	health            *health.Tracker
+	extraRootCAs      *x509.CertPool // additional trusted root CAs; or nil
+	busClient         *eventbus.Client
+	clientVersionPub  *eventbus.Publisher[tailcfg.ClientVersion]
+	autoUpdatePub     *eventbus.Publisher[AutoUpdate]
+	controlTimePub    *eventbus.Publisher[ControlTime]
+	getMachinePrivKey func() (key.MachinePrivate, error)
+	debugFlags        []string
+	pinger            Pinger
+	popBrowser        func(url string)    // or nil
+	polc              policyclient.Client // always non-nil
+	c2nHandler        http.Handler        // or nil
+	panicOnUse        bool                // if true, panic if client is used (for testing)
+	closedCtx         context.Context     // alive until Direct.Close is called
+	closeCtx          context.CancelFunc  // cancels closedCtx
 
 	dialPlan ControlDialPlanner // can be nil
 
-	mu              sync.Mutex        // mutex guards the following fields
+	mu              syncs.Mutex       // mutex guards the following fields
 	serverLegacyKey key.MachinePublic // original ("legacy") nacl crypto_box-based public key; only used for signRegisterRequest on Windows now
 	serverNoiseKey  key.MachinePublic
+	discoPubKey     key.DiscoPublic // protected by mu; can be updated via [SetDiscoPublicKey]
+	ipForwardBroken bool            // protected by mu; can be updated via [SetIPForwardingBroken]
 
 	sfGroup     singleflight.Group[struct{}, *ts2021.Client] // protects noiseClient creation.
 	noiseClient *ts2021.Client                               // also protected by mu
@@ -115,6 +124,9 @@ type Direct struct {
 
 // Observer is implemented by users of the control client (such as LocalBackend)
 // to get notified of changes in the control client's status.
+//
+// If an implementation of Observer also implements [NetmapDeltaUpdater], they get
+// delta updates as well as full netmap updates.
 type Observer interface {
 	// SetControlClientStatus is called when the client has a new status to
 	// report. The Client is provided to allow the Observer to track which
@@ -137,20 +149,25 @@ type Options struct {
 	NoiseTestClient      *http.Client // optional HTTP client to use for noise RPCs (tests only)
 	DebugFlags           []string     // debug settings to send to control
 	HealthTracker        *health.Tracker
+	ExtraRootCAs         *x509.CertPool      // additional trusted root CAs; or nil
 	PopBrowserURL        func(url string)    // optional func to open browser
 	Dialer               *tsdial.Dialer      // non-nil
 	C2NHandler           http.Handler        // or nil
 	ControlKnobs         *controlknobs.Knobs // or nil to ignore
 	Bus                  *eventbus.Bus       // non-nil, for setting up publishers
 
+	SkipStartForTests bool // if true, don't call [Auto.Start] to avoid any background goroutines (for tests only)
+
+	// StartPaused indicates whether the client should start in a paused state
+	// where it doesn't do network requests. This primarily exists for testing
+	// but not necessarily "go test" tests, so it isn't restricted to only
+	// being used in tests.
+	StartPaused bool
+
 	// Observer is called when there's a change in status to report
 	// from the control client.
+	// If nil, no status updates are reported.
 	Observer Observer
-
-	// SkipIPForwardingCheck declares that the host's IP
-	// forwarding works and should not be double-checked by the
-	// controlclient package.
-	SkipIPForwardingCheck bool
 
 	// Pinger optionally specifies the Pinger to use to satisfy
 	// MapResponse.PingRequest queries from the control plane.
@@ -212,12 +229,61 @@ type NetmapUpdater interface {
 // rather than just full updates.
 type NetmapDeltaUpdater interface {
 	// UpdateNetmapDelta is called with discrete changes to the network map.
+	// The mutation slice may contain [netmap.NodeMutationUpsert] entries when
+	// peers are inserted or replaced, and [netmap.NodeMutationRemove] entries
+	// when peers are removed, alongside per-field patches.
 	//
 	// The ok result is whether the implementation was able to apply the
 	// mutations. It might return false if its internal state doesn't
 	// support applying them or a NetmapUpdater it's wrapping doesn't
 	// implement the NetmapDeltaUpdater optional method.
 	UpdateNetmapDelta([]netmap.NodeMutation) (ok bool)
+}
+
+// PacketFilterUpdater is an optional interface that can be implemented by
+// NetmapUpdater implementations to receive incremental packet-filter updates
+// without a full netmap rebuild.
+//
+// It exists because the packet filter currently changes on every peer
+// addition, so a MapResponse carrying PeersChanged almost always also carries
+// PacketFilter (or PacketFilters). Handling the filter narrowly keeps peer
+// churn O(1) on the controlclient side.
+type PacketFilterUpdater interface {
+	// UpdatePacketFilter is called when a MapResponse's PacketFilter (or
+	// PacketFilters) changed. rules is the already-merged concatenation of
+	// the session's named packet filter chunks; parsed is the parsed form.
+	//
+	// It returns false to signal the caller to fall back to a full
+	// netmap rebuild. Proxy/forwarder implementations return false when
+	// their downstream destination doesn't implement
+	// [PacketFilterUpdater]; concrete implementations return true on
+	// successful apply.
+	UpdatePacketFilter(rules views.Slice[tailcfg.FilterRule], parsed []filter.Match) bool
+}
+
+// UserProfileUpdater is an optional interface that can be implemented by
+// NetmapUpdater implementations to receive incremental UserProfile updates
+// without a full netmap rebuild.
+//
+// It exists so consumers of [ipn.Notify.UserProfiles] can be told about
+// new or updated UserProfiles before (or with) the [ipn.Notify.PeersChanged]
+// or [ipn.Notify.PeerChangedPatch] entry that references the corresponding
+// UserID.
+type UserProfileUpdater interface {
+	// UpdateUserProfiles is called when a MapResponse carries UserProfiles
+	// entries. profiles is the new/updated subset (NOT the full map);
+	// implementations should merge with whatever they already know.
+	//
+	// The values are [tailcfg.UserProfileView]s sharing backing memory
+	// with the caller's tracking map; implementations may store them
+	// directly without copying.
+	//
+	// It returns false to signal the caller to fall back to a full
+	// netmap rebuild. Proxy/forwarder implementations return false when
+	// their downstream destination doesn't implement
+	// [UserProfileUpdater]; concrete implementations return true on
+	// successful apply.
+	UpdateUserProfiles(profiles map[tailcfg.UserID]tailcfg.UserProfileView) bool
 }
 
 var nextControlClientID atomic.Int64
@@ -273,12 +339,18 @@ func NewDirect(opts Options) (*Direct, error) {
 	}
 	var interceptedDial *atomic.Bool
 	if httpc == nil {
-		tr := http.DefaultTransport.(*http.Transport).Clone()
+		tr := netutil.NewDefaultTransport()
 		if buildfeatures.HasUseProxy {
 			tr.Proxy = feature.HookProxyFromEnvironment.GetOrNil()
 			if f, ok := feature.HookProxySetTransportGetProxyConnectHeader.GetOk(); ok {
 				f(tr)
 			}
+		}
+		if opts.ExtraRootCAs != nil {
+			if tr.TLSClientConfig == nil {
+				tr.TLSClientConfig = &tls.Config{}
+			}
+			tr.TLSClientConfig.RootCAs = opts.ExtraRootCAs
 		}
 		tr.TLSClientConfig = tlsdial.Config(opts.HealthTracker, tr.TLSClientConfig)
 		var dialFunc netx.DialFunc
@@ -295,28 +367,28 @@ func NewDirect(opts Options) (*Direct, error) {
 	}
 
 	c := &Direct{
-		httpc:                 httpc,
-		interceptedDial:       interceptedDial,
-		controlKnobs:          opts.ControlKnobs,
-		getMachinePrivKey:     opts.GetMachinePrivateKey,
-		serverURL:             opts.ServerURL,
-		clock:                 opts.Clock,
-		logf:                  opts.Logf,
-		persist:               opts.Persist.View(),
-		authKey:               opts.AuthKey,
-		discoPubKey:           opts.DiscoPublicKey,
-		debugFlags:            opts.DebugFlags,
-		netMon:                netMon,
-		health:                opts.HealthTracker,
-		skipIPForwardingCheck: opts.SkipIPForwardingCheck,
-		pinger:                opts.Pinger,
-		polc:                  cmp.Or(opts.PolicyClient, policyclient.Client(policyclient.NoPolicyClient{})),
-		popBrowser:            opts.PopBrowserURL,
-		c2nHandler:            opts.C2NHandler,
-		dialer:                opts.Dialer,
-		dnsCache:              dnsCache,
-		dialPlan:              opts.DialPlan,
+		httpc:             httpc,
+		interceptedDial:   interceptedDial,
+		controlKnobs:      opts.ControlKnobs,
+		getMachinePrivKey: opts.GetMachinePrivateKey,
+		serverURL:         opts.ServerURL,
+		clock:             opts.Clock,
+		logf:              opts.Logf,
+		persist:           opts.Persist.View(),
+		authKey:           opts.AuthKey,
+		debugFlags:        opts.DebugFlags,
+		netMon:            netMon,
+		health:            opts.HealthTracker,
+		extraRootCAs:      opts.ExtraRootCAs,
+		pinger:            opts.Pinger,
+		polc:              cmp.Or(opts.PolicyClient, policyclient.Client(policyclient.NoPolicyClient{})),
+		popBrowser:        opts.PopBrowserURL,
+		c2nHandler:        opts.C2NHandler,
+		dialer:            opts.Dialer,
+		dnsCache:          dnsCache,
+		dialPlan:          opts.DialPlan,
 	}
+	c.discoPubKey = opts.DiscoPublicKey
 	c.closedCtx, c.closeCtx = context.WithCancel(context.Background())
 
 	c.controlClientID = nextControlClientID.Add(1)
@@ -370,7 +442,7 @@ func (c *Direct) SetHostinfo(hi *tailcfg.Hostinfo) bool {
 	if hi == nil {
 		panic("nil Hostinfo")
 	}
-	hi = ptr.To(*hi)
+	hi = new(*hi)
 	hi.NetInfo = nil
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -515,6 +587,49 @@ var macOSScreenTime = health.Register(&health.Warnable{
 	},
 	ImpactsConnectivity: true,
 })
+
+type rateLimitError struct {
+	msg        string
+	retryAfter time.Duration
+}
+
+func (e *rateLimitError) Error() string {
+	return fmt.Sprintf("rate limited: %s (retry after %v)", e.msg, e.retryAfter)
+}
+
+func parseRateLimitError(res *http.Response) *rateLimitError {
+	msg, _ := io.ReadAll(res.Body)
+	res.Body.Close()
+
+	ret := &rateLimitError{
+		msg: strings.TrimSpace(string(msg)),
+	}
+
+	v := res.Header.Get("Retry-After")
+	if i, err := strconv.Atoi(v); err == nil {
+		ret.retryAfter = time.Duration(i) * time.Second
+	} else if t, err := http.ParseTime(v); err == nil {
+		ret.retryAfter = time.Until(t)
+	}
+
+	// If the server didn't give us a valid Retry-After, default to 10s.
+	if ret.retryAfter <= 0 || ret.retryAfter > time.Hour {
+		ret.retryAfter = 5*time.Second + rand.N(5*time.Second)
+	}
+	return ret
+}
+
+// isRateLimitedResponse reports whether a non-200 response should be
+// treated as a rate limit rather than a generic failure subject to backoff.
+func isRateLimitedResponse(res *http.Response) bool {
+	switch res.StatusCode {
+	case http.StatusTooManyRequests:
+		return true
+	case http.StatusServiceUnavailable:
+		return res.Header.Get("Retry-After") != ""
+	}
+	return false
+}
 
 func (c *Direct) doLogin(ctx context.Context, opt loginOpt) (mustRegen bool, newURL string, nks tkatype.MarshaledSignature, err error) {
 	if c.panicOnUse {
@@ -710,6 +825,12 @@ func (c *Direct) doLogin(ctx context.Context, opt loginOpt) (mustRegen bool, new
 	if err != nil {
 		return regen, opt.URL, nil, fmt.Errorf("register request: %w", err)
 	}
+	// Handle 429 Too Many Requests with a specific error type that includes the retry-after duration.
+	if isRateLimitedResponse(res) {
+		rle := parseRateLimitError(res)
+		msg := fmt.Sprintf("node registration rate limited; will retry after %v", rle.retryAfter)
+		return false, "", nil, vizerror.WrapWithMessage(rle, msg)
+	}
 	if res.StatusCode != 200 {
 		msg, _ := io.ReadAll(res.Body)
 		res.Body.Close()
@@ -731,7 +852,7 @@ func (c *Direct) doLogin(ctx context.Context, opt loginOpt) (mustRegen bool, new
 		resp.NodeKeyExpired, resp.MachineAuthorized, resp.AuthURL != "")
 
 	if resp.Error != "" {
-		return false, "", nil, UserVisibleError(resp.Error)
+		return false, "", nil, vizerror.New(resp.Error)
 	}
 	if len(resp.NodeKeySignature) > 0 {
 		return true, "", resp.NodeKeySignature, nil
@@ -816,21 +937,34 @@ func (c *Direct) PollNetMap(ctx context.Context, nu NetmapUpdater) error {
 	return c.sendMapRequest(ctx, true, nu)
 }
 
+// rememberLastNetmapUpdater is a container that remembers the last netmap
+// update it observed. It is used by tests and [NetmapFromMapResponseForDebug].
+// It will report only the first netmap seen.
 type rememberLastNetmapUpdater struct {
 	last *netmap.NetworkMap
+	done chan any
 }
 
 func (nu *rememberLastNetmapUpdater) UpdateFullNetmap(nm *netmap.NetworkMap) {
 	nu.last = nm
+	select {
+	case nu.done <- nil:
+	default:
+	}
 }
 
 // FetchNetMapForTest fetches the netmap once.
 func (c *Direct) FetchNetMapForTest(ctx context.Context) (*netmap.NetworkMap, error) {
 	var nu rememberLastNetmapUpdater
+	nu.done = make(chan any, 1)
 	err := c.sendMapRequest(ctx, false, &nu)
-	if err == nil && nu.last == nil {
+	if err != nil {
+		return nil, err
+	}
+	if nu.last == nil {
 		return nil, errors.New("[unexpected] sendMapRequest success without callback")
 	}
+	<-nu.done
 	return nu.last, err
 }
 
@@ -839,6 +973,26 @@ func (c *Direct) FetchNetMapForTest(ctx context.Context) (*netmap.NetworkMap, er
 // successful 200 OK response.
 func (c *Direct) SendUpdate(ctx context.Context) error {
 	return c.sendMapRequest(ctx, false, nil)
+}
+
+// SetDiscoPublicKey updates the disco public key in local state.
+// It does not implicitly trigger [SendUpdate]; callers should arrange for that.
+func (c *Direct) SetDiscoPublicKey(key key.DiscoPublic) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.discoPubKey = key
+}
+
+// SetIPForwardingBroken updates the IP forwarding broken state.
+// It reports whether the value changed.
+func (c *Direct) SetIPForwardingBroken(v bool) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.ipForwardBroken == v {
+		return false
+	}
+	c.ipForwardBroken = v
+	return true
 }
 
 // ClientID returns the controlClientID of the controlClient.
@@ -890,6 +1044,7 @@ func (c *Direct) sendMapRequest(ctx context.Context, isStreaming bool, nu Netmap
 	persist := c.persist
 	serverURL := c.serverURL
 	serverNoiseKey := c.serverNoiseKey
+	discoKey := c.discoPubKey
 	hi := c.hostInfoLocked()
 	backendLogID := hi.BackendLogID
 	connectionHandleForTest := c.connectionHandleForTest
@@ -933,11 +1088,12 @@ func (c *Direct) sendMapRequest(ctx context.Context, isStreaming bool, nu Netmap
 	}
 
 	nodeKey := persist.PublicNodeKey()
+
 	request := &tailcfg.MapRequest{
 		Version:                 tailcfg.CurrentCapabilityVersion,
 		KeepAlive:               true,
 		NodeKey:                 nodeKey,
-		DiscoKey:                c.discoPubKey,
+		DiscoKey:                discoKey,
 		Endpoints:               eps,
 		EndpointTypes:           epTypes,
 		Stream:                  isStreaming,
@@ -969,10 +1125,6 @@ func (c *Direct) sendMapRequest(ctx context.Context, isStreaming bool, nu Netmap
 	}
 
 	var extraDebugFlags []string
-	if buildfeatures.HasAdvertiseRoutes && hi != nil && c.netMon != nil && !c.skipIPForwardingCheck &&
-		ipForwardingBroken(hi.RoutableIPs, c.netMon.InterfaceState()) {
-		extraDebugFlags = append(extraDebugFlags, "warn-ip-forwarding-off")
-	}
 	if c.health.RouterHealth() != nil {
 		extraDebugFlags = append(extraDebugFlags, "warn-router-unhealthy")
 	}
@@ -994,6 +1146,15 @@ func (c *Direct) sendMapRequest(ctx context.Context, isStreaming bool, nu Netmap
 
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
+
+	// The map response body is a stream of size-prefixed messages. Each
+	// message is capped by maxCompressedMapResponseSize and
+	// maxDecodedMapResponseSize, but a streaming session can carry an
+	// unbounded number of messages over one body, so the body itself must
+	// not be subject to ts2021.Client.Do's default response size cap.
+	// This must happen before the watchdog goroutine below captures ctx:
+	// reassigning ctx after the goroutine exists is a data race.
+	ctx = httpbody.WithMaxSize(ctx, 0)
 
 	machinePubKey := machinePrivKey.Public()
 	t0 := c.clock.Now()
@@ -1042,6 +1203,13 @@ func (c *Direct) sendMapRequest(ctx context.Context, isStreaming bool, nu Netmap
 	}
 	vlogf("netmap: Do = %v after %v", res.StatusCode, time.Since(t0).Round(time.Millisecond))
 	if res.StatusCode != 200 {
+		// The body is an error message rather than a message stream, so
+		// cap it: the map body itself is uncapped per the comment above.
+		httpbody.LimitSizeTo(res, httpbody.DefaultMaxSize)
+		if isRateLimitedResponse(res) {
+			rle := parseRateLimitError(res)
+			return fmt.Errorf("initial fetch failed %d: %w", res.StatusCode, rle)
+		}
 		msg, _ := io.ReadAll(res.Body)
 		res.Body.Close()
 		return fmt.Errorf("initial fetch failed %d: %.200s",
@@ -1081,7 +1249,7 @@ func (c *Direct) sendMapRequest(ctx context.Context, isStreaming bool, nu Netmap
 			c.persist = newPersist.View()
 			persist = c.persist
 		}
-		c.expiry = nm.Expiry
+		c.expiry = nm.SelfKeyExpiry()
 	}
 
 	// gotNonKeepAliveMessage is whether we've yet received a MapResponse message without
@@ -1098,19 +1266,22 @@ func (c *Direct) sendMapRequest(ctx context.Context, isStreaming bool, nu Netmap
 	for mapResIdx := 0; mapResIdx == 0 || isStreaming; mapResIdx++ {
 		watchdogTimer.Reset(watchdogTimeout)
 		vlogf("netmap: starting size read after %v (poll %v)", time.Since(t0).Round(time.Millisecond), mapResIdx)
-		var siz [4]byte
-		if _, err := io.ReadFull(res.Body, siz[:]); err != nil {
-			vlogf("netmap: size read error after %v: %v", time.Since(t0).Round(time.Millisecond), err)
+		msg, err = readMapResponseMessage(res.Body, msg)
+		if err != nil {
+			// If the read failed because the poll's context was
+			// canceled, report that instead of the underlying
+			// transport error. Which error the transport returns for
+			// a read interrupted by cancellation varies by transport
+			// and Go version (Go 1.27's http2 returns the underlying
+			// "use of closed network connection" where earlier
+			// versions returned the context error).
+			if ctx.Err() != nil {
+				err = ctx.Err()
+			}
+			vlogf("netmap: message read error after %v: %v", time.Since(t0).Round(time.Millisecond), err)
 			return err
 		}
-		size := binary.LittleEndian.Uint32(siz[:])
-		vlogf("netmap: read size %v after %v", size, time.Since(t0).Round(time.Millisecond))
-		msg = append(msg[:0], make([]byte, size)...)
-		if _, err := io.ReadFull(res.Body, msg); err != nil {
-			vlogf("netmap: body read error: %v", err)
-			return err
-		}
-		vlogf("netmap: read body after %v", time.Since(t0).Round(time.Millisecond))
+		vlogf("netmap: read message of %d bytes after %v", len(msg), time.Since(t0).Round(time.Millisecond))
 
 		var resp tailcfg.MapResponse
 		if err := sess.decodeMsg(msg, &resp); err != nil {
@@ -1162,7 +1333,19 @@ func (c *Direct) sendMapRequest(ctx context.Context, isStreaming bool, nu Netmap
 			metricMapResponseKeepAlives.Add(1)
 			continue
 		}
-		if au, ok := resp.DefaultAutoUpdate.Get(); ok {
+
+		// DefaultAutoUpdate in its CapMap and deprecated top-level field forms.
+		if self := resp.Node; self != nil {
+			for _, v := range self.CapMap[nodecap.DefaultAutoUpdate] {
+				switch v {
+				case "true", "false":
+					c.autoUpdatePub.Publish(AutoUpdate{c.controlClientID, v == "true"})
+				default:
+					c.logf("netmap: [unexpected] unknown %s in CapMap: %q", nodecap.DefaultAutoUpdate, v)
+				}
+			}
+		}
+		if au, ok := resp.DeprecatedDefaultAutoUpdate.Get(); ok {
 			c.autoUpdatePub.Publish(AutoUpdate{c.controlClientID, au})
 		}
 
@@ -1196,8 +1379,11 @@ func NetmapFromMapResponseForDebug(ctx context.Context, pr persist.PersistView, 
 	if resp.Node == nil {
 		return nil, errors.New("MapResponse lacks Node")
 	}
+	if !pr.Valid() {
+		return nil, errors.New("PersistView invalid")
+	}
 
-	nu := &rememberLastNetmapUpdater{}
+	nu := &rememberLastNetmapUpdater{done: make(chan any, 1)}
 	sess := newMapSession(pr.PrivateNodeKey(), nu, nil)
 	defer sess.Close()
 
@@ -1205,6 +1391,7 @@ func NetmapFromMapResponseForDebug(ctx context.Context, pr persist.PersistView, 
 		return nil, fmt.Errorf("HandleNonKeepAliveMapResponse: %w", err)
 	}
 
+	<-nu.done
 	return sess.netmap(), nil
 }
 
@@ -1264,20 +1451,53 @@ var jsonEscapedZero = []byte(`\u0000`)
 
 const justKeepAliveStr = `{"KeepAlive":true}`
 
+// maxCompressedMapResponseSize bounds the on-the-wire size of a single map
+// response message. The size prefix is a little-endian uint32 the control
+// server chooses, so without a cap a malicious control server can make us
+// allocate up to 4 GiB before reading any body bytes. Real production traffic
+// has hit a 16 MB cap before, so the cap stays far above any plausible
+// legitimate size.
+const maxCompressedMapResponseSize = 256 << 20
+
+// maxDecodedMapResponseSize bounds the decompressed size of a single map
+// response message, so a malicious control server can't expand a small zstd
+// frame into an unbounded amount of JSON.
+const maxDecodedMapResponseSize = 1 << 30
+
+// readMapResponseMessage reads a single map response message from r: a
+// little-endian uint32 size followed by that many bytes. The returned message
+// reuses msg's backing storage. Sizes beyond [maxCompressedMapResponseSize]
+// are rejected before any allocation.
+func readMapResponseMessage(r io.Reader, msg []byte) ([]byte, error) {
+	var siz [4]byte
+	if _, err := io.ReadFull(r, siz[:]); err != nil {
+		return msg, err
+	}
+	size := binary.LittleEndian.Uint32(siz[:])
+	if size > maxCompressedMapResponseSize {
+		return msg, fmt.Errorf("map response message size %d exceeds max %d", size, maxCompressedMapResponseSize)
+	}
+	msg = append(msg[:0], make([]byte, size)...)
+	if _, err := io.ReadFull(r, msg); err != nil {
+		return msg, err
+	}
+	return msg, nil
+}
+
 // decodeMsg is responsible for uncompressing msg and unmarshaling into v.
-func (sess *mapSession) decodeMsg(compressedMsg []byte, v *tailcfg.MapResponse) error {
+func (ms *mapSession) decodeMsg(compressedMsg []byte, v *tailcfg.MapResponse) error {
 	// Fast path for common case of keep-alive message.
 	// See tailscale/tailscale#17343.
-	if sess.keepAliveZ != nil && bytes.Equal(compressedMsg, sess.keepAliveZ) {
+	if ms.keepAliveZ != nil && bytes.Equal(compressedMsg, ms.keepAliveZ) {
 		v.KeepAlive = true
 		return nil
 	}
 
-	b, err := zstdframe.AppendDecode(nil, compressedMsg)
+	b, err := zstdframe.AppendDecode(nil, compressedMsg, zstdframe.MaxDecodedSize(maxDecodedMapResponseSize))
 	if err != nil {
 		return err
 	}
-	sess.ztdDecodesForTest++
+	ms.ztdDecodesForTest++
 
 	if DevKnob.DumpNetMaps() {
 		var buf bytes.Buffer
@@ -1292,7 +1512,7 @@ func (sess *mapSession) decodeMsg(compressedMsg []byte, v *tailcfg.MapResponse) 
 		return fmt.Errorf("response: %v", err)
 	}
 	if v.KeepAlive && string(b) == justKeepAliveStr {
-		sess.keepAliveZ = compressedMsg
+		ms.keepAliveZ = compressedMsg
 	}
 	return nil
 }
@@ -1323,7 +1543,8 @@ func loadServerPubKeys(ctx context.Context, httpc *http.Client, serverURL string
 		return nil, fmt.Errorf("fetch control key: %v", err)
 	}
 	defer res.Body.Close()
-	b, err := io.ReadAll(io.LimitReader(res.Body, 64<<10))
+	httpbody.LimitSizeTo(res, 64<<10)
+	b, err := io.ReadAll(res.Body)
 	if err != nil {
 		return nil, fmt.Errorf("fetch control key response: %v", err)
 	}
@@ -1375,24 +1596,6 @@ func initDevKnob() devKnobs {
 }
 
 var clock tstime.Clock = tstime.StdClock{}
-
-// ipForwardingBroken reports whether the system's IP forwarding is disabled
-// and will definitely not work for the routes provided.
-//
-// It should not return false positives.
-//
-// TODO(bradfitz): Change controlclient.Options.SkipIPForwardingCheck into a
-// func([]netip.Prefix) error signature instead.
-func ipForwardingBroken(routes []netip.Prefix, state *netmon.State) bool {
-	warn, err := netutil.CheckIPForwarding(routes, state)
-	if err != nil {
-		// Oh well, we tried. This is just for debugging.
-		// We don't want false positives.
-		// TODO: maybe we want a different warning for inability to check?
-		return false
-	}
-	return warn != nil
-}
 
 // isUniquePingRequest reports whether pr contains a new PingRequest.URL
 // not already handled, noting its value when returning true.
@@ -1447,7 +1650,7 @@ func (c *Direct) answerPing(pr *tailcfg.PingRequest) {
 		}
 		return
 	}
-	for _, t := range strings.Split(pr.Types, ",") {
+	for t := range strings.SplitSeq(pr.Types, ",") {
 		switch pt := tailcfg.PingType(t); pt {
 		case tailcfg.PingTSMP, tailcfg.PingDisco, tailcfg.PingICMP, tailcfg.PingPeerAPI:
 			go doPingerPing(c.logf, httpc, pr, c.pinger, pt)
@@ -1533,6 +1736,7 @@ func (c *Direct) getNoiseClient() (*ts2021.Client, error) {
 			Logf:          c.logf,
 			NetMon:        c.netMon,
 			HealthTracker: c.health,
+			ExtraRootCAs:  c.extraRootCAs,
 			DialPlan:      dp,
 		})
 		if err != nil {

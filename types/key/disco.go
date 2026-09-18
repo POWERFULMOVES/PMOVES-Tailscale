@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 package key
@@ -39,6 +39,16 @@ func NewDisco() DiscoPrivate {
 	rand(ret.k[:])
 	// Key used for nacl seal/open, so needs to be clamped.
 	clamp25519Private(ret.k[:])
+	return ret
+}
+
+// DiscoPrivateFromRaw32 parses a 32-byte raw value as a DiscoPrivate.
+func DiscoPrivateFromRaw32(raw mem.RO) DiscoPrivate {
+	if raw.Len() != 32 {
+		panic("input has wrong size")
+	}
+	var ret DiscoPrivate
+	raw.Copy(ret.k[:])
 	return ret
 }
 
@@ -167,11 +177,11 @@ func (k DiscoPublic) String() string {
 }
 
 // Compare returns an integer comparing DiscoPublic k and l lexicographically.
-// The result will be 0 if k == l, -1 if k < l, and +1 if k > l. This is useful
-// for situations requiring only one node in a pair to perform some operation,
-// e.g. probing UDP path lifetime.
-func (k DiscoPublic) Compare(l DiscoPublic) int {
-	return bytes.Compare(k.k[:], l.k[:])
+// The result will be 0 if k == other, -1 if k < other, and +1 if k > other.
+// This is useful for situations requiring only one node in a pair to perform
+// some operation, e.g. probing UDP path lifetime.
+func (k DiscoPublic) Compare(other DiscoPublic) int {
+	return bytes.Compare(k.k[:], other.k[:])
 }
 
 // AppendText implements encoding.TextAppender.

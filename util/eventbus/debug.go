@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 package eventbus
@@ -11,10 +11,10 @@ import (
 	"runtime"
 	"slices"
 	"strings"
-	"sync"
 	"sync/atomic"
 	"time"
 
+	"tailscale.com/syncs"
 	"tailscale.com/types/logger"
 )
 
@@ -147,7 +147,7 @@ func (d *Debugger) SubscribeTypes(client *Client) []reflect.Type {
 
 // A hook collects hook functions that can be run as a group.
 type hook[T any] struct {
-	sync.Mutex
+	syncs.Mutex
 	fns []hookFn[T]
 }
 

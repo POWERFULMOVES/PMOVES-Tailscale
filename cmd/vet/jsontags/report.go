@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 package jsontags
@@ -74,23 +74,23 @@ const (
 	OmitEmptyShouldBeOmitZero             ReportKind = "OmitEmptyShouldBeOmitZero"
 	OmitEmptyShouldBeOmitZeroButHasIsZero ReportKind = "OmitEmptyShouldBeOmitZeroButHasIsZero"
 	StringOnNonNumericKind                ReportKind = "StringOnNonNumericKind"
-	FormatMissingOnTimeDuration           ReportKind = "FormatMissingOnTimeDuration"
+	FormatUnsupported                     ReportKind = "FormatUnsupported"
 )
 
 func (k ReportKind) message() string {
 	switch k {
 	case OmitEmptyUnsupportedInV1:
-		return "uses `omitempty` on an unspported type in json/v1; should probably use `omitzero` instead"
+		return "uses `omitempty` on an unsupported type in json/v1; should probably use `omitzero` instead"
 	case OmitEmptyUnsupportedInV2:
-		return "uses `omitempty` on an unspported type in json/v2; should probably use `omitzero` instead"
+		return "uses `omitempty` on an unsupported type in json/v2; should probably use `omitzero` instead"
 	case OmitEmptyShouldBeOmitZero:
 		return "should use `omitzero` instead of `omitempty`"
 	case OmitEmptyShouldBeOmitZeroButHasIsZero:
 		return "should probably use `omitzero` instead of `omitempty`"
 	case StringOnNonNumericKind:
 		return "must not use `string` on non-numeric types"
-	case FormatMissingOnTimeDuration:
-		return "must use an explicit `format` tag (e.g., `format:nano`) on a time.Duration type; see https://go.dev/issue/71631"
+	case FormatUnsupported:
+		return "must not use the `format` tag option; Go 1.27's encoding/json rejects it at runtime (see tailscale/tailscale#20528)"
 	default:
 		return string(k)
 	}

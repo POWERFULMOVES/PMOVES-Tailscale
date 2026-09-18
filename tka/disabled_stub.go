@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 //go:build ts_omit_tailnetlock
@@ -8,6 +8,7 @@ package tka
 import (
 	"crypto/ed25519"
 	"errors"
+	"time"
 
 	"tailscale.com/types/key"
 	"tailscale.com/types/logger"
@@ -22,7 +23,24 @@ type Authority struct {
 
 func (*Authority) Head() AUMHash { return AUMHash{} }
 
-func (AUMHash) MarshalText() ([]byte, error) { return nil, errNoTailnetLock }
+// MarshalText returns a dummy value explaining that Tailnet Lock
+// is not compiled in to this binary.
+//
+// We need to be able to marshal AUMHash to text because it's included
+// in [netmap.NetworkMap], which gets serialised as JSON in the
+// c2n /debug/netmap endpoint.
+//
+// We provide a basic marshaller so that endpoint works correctly
+// with nodes that omit Tailnet Lock support, but we don't want the
+// base32 dependency used for the regular marshaller, and we don't
+// need unmarshalling support at time of writing (2025-11-18).
+func (h AUMHash) MarshalText() ([]byte, error) {
+	return []byte("<tailnet-lock-omitted>"), nil
+}
+
+func (h *AUMHash) UnmarshalText(text []byte) error {
+	return errors.New("tailnet lock is not supported by this binary")
+}
 
 type State struct{}
 
@@ -128,12 +146,6 @@ type NodeKeySignature struct {
 type DeeplinkValidationResult struct {
 }
 
-func (h *AUMHash) UnmarshalText(text []byte) error {
-	return errNoTailnetLock
-}
-
-var errNoTailnetLock = errors.New("tailnet lock is not enabled")
-
 func DecodeWrappedAuthkey(wrappedAuthKey string, logf logger.Logf) (authKey string, isWrapped bool, sig *NodeKeySignature, priv ed25519.PrivateKey) {
 	return wrappedAuthKey, false, nil, nil
 }
@@ -147,3 +159,8 @@ func SignByCredential(privKey []byte, wrapped *NodeKeySignature, nodeKey key.Nod
 }
 
 func (s NodeKeySignature) String() string { return "" }
+
+type CompactionOptions struct {
+	MinChain int
+	MinAge   time.Duration
+}

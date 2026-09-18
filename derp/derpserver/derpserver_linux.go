@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 //go:build linux && !android
@@ -62,6 +62,9 @@ func (c *sclient) tcpConn() *net.TCPConn {
 		case *net.TCPConn:
 			return v
 		case *tls.Conn:
+			nc = v.NetConn()
+		case interface{ NetConn() net.Conn }:
+			// Wrappers such as cmd/derper's connection close hook.
 			nc = v.NetConn()
 		default:
 			return nil

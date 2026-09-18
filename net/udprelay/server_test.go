@@ -1,21 +1,29 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 package udprelay
 
 import (
 	"bytes"
+	"crypto/rand"
 	"net"
 	"net/netip"
+	"sync"
 	"testing"
 	"time"
 
+	qt "github.com/frankban/quicktest"
 	"github.com/google/go-cmp/cmp"
 	"github.com/google/go-cmp/cmp/cmpopts"
 	"go4.org/mem"
+	"golang.org/x/crypto/blake2s"
 	"tailscale.com/disco"
 	"tailscale.com/net/packet"
+	"tailscale.com/tstime/mono"
 	"tailscale.com/types/key"
+	"tailscale.com/types/views"
+	"tailscale.com/util/mak"
+	"tailscale.com/util/usermetric"
 )
 
 type testClient struct {
@@ -184,31 +192,42 @@ func TestServer(t *testing.T) {
 
 	cases := []struct {
 		name                string
-		overrideAddrs       []netip.Addr
+		staticAddrs         []netip.Addr
 		forceClientsMixedAF bool
 	}{
 		{
-			name:          "over ipv4",
-			overrideAddrs: []netip.Addr{netip.MustParseAddr("127.0.0.1")},
+			name:        "over-ipv4",
+			staticAddrs: []netip.Addr{netip.MustParseAddr("127.0.0.1")},
 		},
 		{
-			name:          "over ipv6",
-			overrideAddrs: []netip.Addr{netip.MustParseAddr("::1")},
+			name:        "over-ipv6",
+			staticAddrs: []netip.Addr{netip.MustParseAddr("::1")},
 		},
 		{
-			name:                "mixed address families",
-			overrideAddrs:       []netip.Addr{netip.MustParseAddr("127.0.0.1"), netip.MustParseAddr("::1")},
+			name:                "mixed-address-families",
+			staticAddrs:         []netip.Addr{netip.MustParseAddr("127.0.0.1"), netip.MustParseAddr("::1")},
 			forceClientsMixedAF: true,
 		},
 	}
 
 	for _, tt := range cases {
 		t.Run(tt.name, func(t *testing.T) {
-			server, err := NewServer(t.Logf, 0, tt.overrideAddrs)
+			reg := new(usermetric.Registry)
+			deregisterMetrics()
+			server, err := NewServer(t.Logf, 0, true, reg, nil)
 			if err != nil {
 				t.Fatal(err)
 			}
 			defer server.Close()
+			addrPorts := make([]netip.AddrPort, 0, len(tt.staticAddrs))
+			for _, addr := range tt.staticAddrs {
+				if addr.Is4() {
+					addrPorts = append(addrPorts, netip.AddrPortFrom(addr, server.uc4Port))
+				} else if server.uc6Port != 0 {
+					addrPorts = append(addrPorts, netip.AddrPortFrom(addr, server.uc6Port))
+				}
+			}
+			server.SetStaticAddrPorts(views.SliceOf(addrPorts))
 
 			endpoint, err := server.AllocateEndpoint(discoA.Public(), discoB.Public())
 			if err != nil {
@@ -246,7 +265,7 @@ func TestServer(t *testing.T) {
 			tcB := newTestClient(t, endpoint.VNI, tcBServerEndpointAddr, discoB, discoA.Public(), endpoint.ServerDisco)
 			defer tcB.close()
 
-			for i := 0; i < 2; i++ {
+			for range 2 {
 				// We handshake both clients twice to guarantee server-side
 				// packet reading goroutines, which are independent across
 				// address families, have seen an answer from both clients
@@ -317,5 +336,238 @@ func TestServer(t *testing.T) {
 				t.Fatal("unexpected msg B->A")
 			}
 		})
+	}
+}
+
+func TestServer_getNextVNILocked(t *testing.T) {
+	t.Parallel()
+	c := qt.New(t)
+	s := &Server{
+		nextVNI: minVNI,
+	}
+	for range uint64(totalPossibleVNI) {
+		vni, err := s.getNextVNILocked()
+		if err != nil { // using quicktest here triples test time
+			t.Fatal(err)
+		}
+		s.serverEndpointByVNI.Store(vni, nil)
+	}
+	c.Assert(s.nextVNI, qt.Equals, minVNI)
+	_, err := s.getNextVNILocked()
+	c.Assert(err, qt.IsNotNil)
+	s.serverEndpointByVNI.Delete(minVNI)
+	_, err = s.getNextVNILocked()
+	c.Assert(err, qt.IsNil)
+}
+
+func Test_blakeMACFromBindMsg(t *testing.T) {
+	var macSecret [blake2s.Size]byte
+	rand.Read(macSecret[:])
+	src := netip.MustParseAddrPort("[2001:db8::1]:7")
+
+	msgA := disco.BindUDPRelayEndpointCommon{
+		VNI:        1,
+		Generation: 1,
+		RemoteKey:  key.NewDisco().Public(),
+		Challenge:  [32]byte{},
+	}
+	macA, err := blakeMACFromBindMsg(macSecret, src, msgA)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	msgB := msgA
+	msgB.VNI++
+	macB, err := blakeMACFromBindMsg(macSecret, src, msgB)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if macA == macB {
+		t.Fatalf("varying VNI input produced identical mac: %v", macA)
+	}
+
+	msgC := msgA
+	msgC.Generation++
+	macC, err := blakeMACFromBindMsg(macSecret, src, msgC)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if macA == macC {
+		t.Fatalf("varying Generation input produced identical mac: %v", macA)
+	}
+
+	msgD := msgA
+	msgD.RemoteKey = key.NewDisco().Public()
+	macD, err := blakeMACFromBindMsg(macSecret, src, msgD)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if macA == macD {
+		t.Fatalf("varying RemoteKey input produced identical mac: %v", macA)
+	}
+
+	msgE := msgA
+	msgE.Challenge = [32]byte{0x01} // challenge is not part of the MAC and should be ignored
+	macE, err := blakeMACFromBindMsg(macSecret, src, msgE)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if macA != macE {
+		t.Fatalf("varying Challenge input produced varying mac: %v", macA)
+	}
+
+	macSecretB := macSecret
+	macSecretB[0] ^= 0xFF
+	macF, err := blakeMACFromBindMsg(macSecretB, src, msgA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if macA == macF {
+		t.Fatalf("varying macSecret input produced identical mac: %v", macA)
+	}
+
+	srcB := netip.AddrPortFrom(src.Addr(), src.Port()+1)
+	macG, err := blakeMACFromBindMsg(macSecret, srcB, msgA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if macA == macG {
+		t.Fatalf("varying src input produced identical mac: %v", macA)
+	}
+}
+
+func Benchmark_blakeMACFromBindMsg(b *testing.B) {
+	var macSecret [blake2s.Size]byte
+	rand.Read(macSecret[:])
+	src := netip.MustParseAddrPort("[2001:db8::1]:7")
+	msg := disco.BindUDPRelayEndpointCommon{
+		VNI:        1,
+		Generation: 1,
+		RemoteKey:  key.NewDisco().Public(),
+		Challenge:  [32]byte{},
+	}
+	b.ReportAllocs()
+	for b.Loop() {
+		_, err := blakeMACFromBindMsg(macSecret, src, msg)
+		if err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+func TestServer_maybeRotateMACSecretLocked(t *testing.T) {
+	s := &Server{}
+	start := mono.Now()
+	s.maybeRotateMACSecretLocked(start)
+	qt.Assert(t, s.macSecrets.Len(), qt.Equals, 1)
+	macSecret := s.macSecrets.At(0)
+	s.maybeRotateMACSecretLocked(start.Add(macSecretRotationInterval - time.Nanosecond))
+	qt.Assert(t, s.macSecrets.Len(), qt.Equals, 1)
+	qt.Assert(t, s.macSecrets.At(0), qt.Equals, macSecret)
+	s.maybeRotateMACSecretLocked(start.Add(macSecretRotationInterval))
+	qt.Assert(t, s.macSecrets.Len(), qt.Equals, 2)
+	qt.Assert(t, s.macSecrets.At(1), qt.Equals, macSecret)
+	qt.Assert(t, s.macSecrets.At(0), qt.Not(qt.Equals), s.macSecrets.At(1))
+	s.maybeRotateMACSecretLocked(s.macSecretRotatedAt.Add(macSecretRotationInterval))
+	qt.Assert(t, macSecret, qt.Not(qt.Equals), s.macSecrets.At(0))
+	qt.Assert(t, macSecret, qt.Not(qt.Equals), s.macSecrets.At(1))
+	qt.Assert(t, s.macSecrets.At(0), qt.Not(qt.Equals), s.macSecrets.At(1))
+}
+
+func TestServer_endpointGC(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		addrs       [2]netip.AddrPort
+		lastSeen    [2]mono.Time
+		allocatedAt mono.Time
+		wantRemoved bool
+	}{
+		{
+			name:        "unbound_endpoint_expired",
+			allocatedAt: mono.Now().Add(-2 * defaultBindLifetime),
+			wantRemoved: true,
+		},
+		{
+			name:        "unbound_endpoint_kept",
+			allocatedAt: mono.Now(),
+			wantRemoved: false,
+		},
+		{
+			name:        "bound_endpoint_expired_a",
+			addrs:       [2]netip.AddrPort{netip.MustParseAddrPort("192.0.2.1:1"), netip.MustParseAddrPort("192.0.2.2:1")},
+			lastSeen:    [2]mono.Time{mono.Now().Add(-2 * defaultSteadyStateLifetime), mono.Now()},
+			wantRemoved: true,
+		},
+		{
+			name:        "bound_endpoint_expired_b",
+			addrs:       [2]netip.AddrPort{netip.MustParseAddrPort("192.0.2.1:1"), netip.MustParseAddrPort("192.0.2.2:1")},
+			lastSeen:    [2]mono.Time{mono.Now(), mono.Now().Add(-2 * defaultSteadyStateLifetime)},
+			wantRemoved: true,
+		},
+		{
+			name:        "bound_endpoint_kept",
+			addrs:       [2]netip.AddrPort{netip.MustParseAddrPort("192.0.2.1:1"), netip.MustParseAddrPort("192.0.2.2:1")},
+			lastSeen:    [2]mono.Time{mono.Now(), mono.Now()},
+			wantRemoved: false,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			disco1 := key.NewDisco()
+			disco2 := key.NewDisco()
+			pair := key.NewSortedPairOfDiscoPublic(disco1.Public(), disco2.Public())
+			ep := &serverEndpoint{
+				discoPubKeys:   pair,
+				vni:            1,
+				lastSeen:       tc.lastSeen,
+				boundAddrPorts: tc.addrs,
+				allocatedAt:    tc.allocatedAt,
+			}
+			s := &Server{serverEndpointByVNI: sync.Map{}, metrics: &metrics{}}
+			mak.Set(&s.serverEndpointByDisco, pair, ep)
+			s.serverEndpointByVNI.Store(ep.vni, ep)
+			s.endpointGC(defaultBindLifetime, defaultSteadyStateLifetime)
+			removed := len(s.serverEndpointByDisco) > 0
+			if tc.wantRemoved {
+				if removed {
+					t.Errorf("expected endpoint to be removed from Server")
+				}
+				if !ep.closed {
+					t.Errorf("expected endpoint to be closed")
+				}
+			} else {
+				if !removed {
+					t.Errorf("expected endpoint to remain in Server")
+				}
+				if ep.closed {
+					t.Errorf("expected endpoint to remain open")
+				}
+			}
+		})
+	}
+}
+
+// TestAllocateEndpointZeroClientDisco verifies that AllocateEndpoint rejects
+// zero client disco keys with an error rather than panicking in
+// DiscoPrivate.Shared, which rejects zero keys. A zero key can arrive from a
+// malicious AllocateUDPRelayEndpointRequest, whose ClientDisco is
+// attacker-chosen.
+func TestAllocateEndpointZeroClientDisco(t *testing.T) {
+	reg := new(usermetric.Registry)
+	deregisterMetrics()
+	server, err := NewServer(t.Logf, 0, true, reg, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer server.Close()
+	server.SetStaticAddrPorts(views.SliceOf([]netip.AddrPort{netip.MustParseAddrPort("127.0.0.1:1")}))
+
+	disco := key.NewDisco().Public()
+	for _, pair := range [][2]key.DiscoPublic{
+		{key.DiscoPublic{}, disco},
+		{disco, key.DiscoPublic{}},
+	} {
+		if _, err := server.AllocateEndpoint(pair[0], pair[1]); err == nil {
+			t.Fatal("AllocateEndpoint succeeded with zero client disco key")
+		}
 	}
 }

@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 //go:build !ts_omit_netlog && !ts_omit_logtail
@@ -53,7 +53,7 @@ func TestToMessage(t *testing.T) {
 		selfNode: nodeUser{NodeView: (&tailcfg.Node{
 			ID:        123456,
 			StableID:  "n123456CNTL",
-			Name:      "src.tail123456.ts.net",
+			Name:      "src.tail123456.ts.net.",
 			Addresses: []netip.Prefix{prefix("100.1.2.3")},
 			Tags:      []string{"tag:src"},
 		}).View()},
@@ -64,14 +64,14 @@ func TestToMessage(t *testing.T) {
 			addr("100.1.2.4"): {NodeView: (&tailcfg.Node{
 				ID:        123457,
 				StableID:  "n123457CNTL",
-				Name:      "dst1.tail123456.ts.net",
+				Name:      "dst1.tail123456.ts.net.",
 				Addresses: []netip.Prefix{prefix("100.1.2.4")},
 				Tags:      []string{"tag:dst1"},
 			}).View()},
 			addr("100.1.2.5"): {NodeView: (&tailcfg.Node{
 				ID:        123458,
 				StableID:  "n123458CNTL",
-				Name:      "dst2.tail123456.ts.net",
+				Name:      "dst2.tail123456.ts.net.",
 				Addresses: []netip.Prefix{prefix("100.1.2.5")},
 				Tags:      []string{"tag:dst2"},
 			}).View()},
@@ -163,7 +163,7 @@ func TestToNode(t *testing.T) {
 		{
 			node: &tailcfg.Node{
 				StableID:  "n123456CNTL",
-				Name:      "test.tail123456.ts.net",
+				Name:      "test.tail123456.ts.net.",
 				Addresses: []netip.Prefix{prefix("100.1.2.3")},
 				Tags:      []string{"tag:dupe", "tag:test", "tag:dupe"},
 				User:      12345, // should be ignored
@@ -216,15 +216,6 @@ func TestToNode(t *testing.T) {
 			t.Errorf("toNode mismatch (-got +want):\n%s", d)
 		}
 	}
-}
-
-func FuzzQuotedLen(f *testing.F) {
-	for _, s := range quotedLenTestdata {
-		f.Add(s)
-	}
-	f.Fuzz(func(t *testing.T, s string) {
-		testQuotedLen(t, s)
-	})
 }
 
 func TestQuotedLen(t *testing.T) {

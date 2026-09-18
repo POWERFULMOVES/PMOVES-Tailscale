@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 // The tsidp command is an OpenID Connect Identity Provider server.
@@ -44,6 +44,7 @@ import (
 	"tailscale.com/ipn"
 	"tailscale.com/ipn/ipnstate"
 	"tailscale.com/tailcfg"
+	"tailscale.com/tailcfg/peercap"
 	"tailscale.com/tsnet"
 	"tailscale.com/types/key"
 	"tailscale.com/types/lazy"
@@ -287,7 +288,7 @@ func serveOnLocalTailscaled(ctx context.Context, lc *local.Client, st *ipnstate.
 	// We watch the IPN bus just to get a session ID. The session expires
 	// when we stop watching the bus, and that auto-deletes the foreground
 	// serve/funnel configs we are creating below.
-	watcher, err := lc.WatchIPNBus(ctx, ipn.NotifyInitialState|ipn.NotifyNoPrivateKeys)
+	watcher, err := lc.WatchIPNBus(ctx, ipn.NotifyInitialState)
 	if err != nil {
 		return nil, nil, fmt.Errorf("could not set up ipn bus watcher: %v", err)
 	}
@@ -672,7 +673,7 @@ func (s *idpServer) serveUserInfo(w http.ResponseWriter, r *http.Request) {
 	// TODO(maisem): not sure if this is the right thing to do
 	ui.UserName, _, _ = strings.Cut(ar.remoteUser.UserProfile.LoginName, "@")
 
-	rules, err := tailcfg.UnmarshalCapJSON[capRule](ar.remoteUser.CapMap, tailcfg.PeerCapabilityTsIDP)
+	rules, err := tailcfg.UnmarshalCapJSON[capRule](ar.remoteUser.CapMap, peercap.TsIDP)
 	if err != nil {
 		http.Error(w, "tsidp: failed to unmarshal capability: %v", http.StatusBadRequest)
 		return
@@ -964,7 +965,7 @@ func (s *idpServer) serveToken(w http.ResponseWriter, r *http.Request) {
 		tsClaims.Issuer = s.loopbackURL
 	}
 
-	rules, err := tailcfg.UnmarshalCapJSON[capRule](who.CapMap, tailcfg.PeerCapabilityTsIDP)
+	rules, err := tailcfg.UnmarshalCapJSON[capRule](who.CapMap, peercap.TsIDP)
 	if err != nil {
 		log.Printf("tsidp: failed to unmarshal capability: %v", err)
 		http.Error(w, err.Error(), http.StatusBadRequest)
@@ -1403,7 +1404,7 @@ func readUint64(r io.Reader) (uint64, error) {
 	}
 }
 
-// rsaPrivateKeyJSONWrapper is the the JSON serialization
+// rsaPrivateKeyJSONWrapper is the JSON serialization
 // format used by RSAPrivateKey.
 type rsaPrivateKeyJSONWrapper struct {
 	Key string

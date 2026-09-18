@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 // Package main tests for tsidp focus on OAuth security boundaries and
@@ -42,6 +42,7 @@ import (
 	"tailscale.com/client/local"
 	"tailscale.com/client/tailscale/apitype"
 	"tailscale.com/tailcfg"
+	"tailscale.com/tailcfg/peercap"
 	"tailscale.com/types/key"
 	"tailscale.com/types/opt"
 	"tailscale.com/types/views"
@@ -137,14 +138,14 @@ func TestFlattenExtraClaims(t *testing.T) {
 		expected map[string]any
 	}{
 		{
-			name: "empty extra claims",
+			name: "empty-extra-claims",
 			input: []capRule{
 				{ExtraClaims: map[string]any{}},
 			},
 			expected: map[string]any{},
 		},
 		{
-			name: "string and number values",
+			name: "string-and-number-values",
 			input: []capRule{
 				{
 					ExtraClaims: map[string]any{
@@ -159,7 +160,7 @@ func TestFlattenExtraClaims(t *testing.T) {
 			},
 		},
 		{
-			name: "slice of strings and ints",
+			name: "slice-of-strings-and-ints",
 			input: []capRule{
 				{
 					ExtraClaims: map[string]any{
@@ -172,7 +173,8 @@ func TestFlattenExtraClaims(t *testing.T) {
 			},
 		},
 		{
-			name: "duplicate values deduplicated (slice input)",
+			// duplicate values deduplicated via slice input
+			name: "dedup-slice-input",
 			input: []capRule{
 				{
 					ExtraClaims: map[string]any{
@@ -190,7 +192,8 @@ func TestFlattenExtraClaims(t *testing.T) {
 			},
 		},
 		{
-			name: "ignore unsupported map type, keep valid scalar",
+			// ignore unsupported map type, keep valid scalar
+			name: "ignore-unsupported-map-keep-scalar",
 			input: []capRule{
 				{
 					ExtraClaims: map[string]any{
@@ -204,7 +207,7 @@ func TestFlattenExtraClaims(t *testing.T) {
 			},
 		},
 		{
-			name: "scalar first, slice second",
+			name: "scalar-first-slice-second",
 			input: []capRule{
 				{ExtraClaims: map[string]any{"foo": "bar"}},
 				{ExtraClaims: map[string]any{"foo": []any{"baz"}}},
@@ -214,7 +217,7 @@ func TestFlattenExtraClaims(t *testing.T) {
 			},
 		},
 		{
-			name: "conflicting scalar and unsupported map",
+			name: "conflicting-scalar-and-unsupported-map",
 			input: []capRule{
 				{ExtraClaims: map[string]any{"foo": "bar"}},
 				{ExtraClaims: map[string]any{"foo": map[string]any{"bad": "entry"}}},
@@ -224,7 +227,7 @@ func TestFlattenExtraClaims(t *testing.T) {
 			},
 		},
 		{
-			name: "multiple slices with overlap",
+			name: "multiple-slices-with-overlap",
 			input: []capRule{
 				{ExtraClaims: map[string]any{"roles": []any{"admin", "user"}}},
 				{ExtraClaims: map[string]any{"roles": []any{"admin", "guest"}}},
@@ -234,7 +237,7 @@ func TestFlattenExtraClaims(t *testing.T) {
 			},
 		},
 		{
-			name: "slice with unsupported values",
+			name: "slice-with-unsupported-values",
 			input: []capRule{
 				{ExtraClaims: map[string]any{
 					"mixed": []any{"ok", 42, map[string]string{"oops": "fail"}},
@@ -245,7 +248,7 @@ func TestFlattenExtraClaims(t *testing.T) {
 			},
 		},
 		{
-			name: "duplicate scalar value",
+			name: "duplicate-scalar-value",
 			input: []capRule{
 				{ExtraClaims: map[string]any{"env": "prod"}},
 				{ExtraClaims: map[string]any{"env": "prod"}},
@@ -279,7 +282,7 @@ func TestExtraClaims(t *testing.T) {
 		expectError bool
 	}{
 		{
-			name: "extra claim",
+			name: "extra-claim",
 			claim: tailscaleClaims{
 				Claims:    jwt.Claims{},
 				Nonce:     "foobar",
@@ -312,7 +315,7 @@ func TestExtraClaims(t *testing.T) {
 			},
 		},
 		{
-			name: "duplicate claim distinct values",
+			name: "duplicate-claim-distinct-values",
 			claim: tailscaleClaims{
 				Claims:    jwt.Claims{},
 				Nonce:     "foobar",
@@ -350,7 +353,7 @@ func TestExtraClaims(t *testing.T) {
 			},
 		},
 		{
-			name: "multiple extra claims",
+			name: "multiple-extra-claims",
 			claim: tailscaleClaims{
 				Claims:    jwt.Claims{},
 				Nonce:     "foobar",
@@ -389,7 +392,7 @@ func TestExtraClaims(t *testing.T) {
 			},
 		},
 		{
-			name: "overwrite claim",
+			name: "overwrite-claim",
 			claim: tailscaleClaims{
 				Claims:    jwt.Claims{},
 				Nonce:     "foobar",
@@ -422,7 +425,7 @@ func TestExtraClaims(t *testing.T) {
 			expectError: true,
 		},
 		{
-			name: "empty extra claims",
+			name: "empty-extra-claims",
 			claim: tailscaleClaims{
 				Claims:    jwt.Claims{},
 				Nonce:     "foobar",
@@ -496,21 +499,21 @@ func TestServeToken(t *testing.T) {
 		expected    map[string]any
 	}{
 		{
-			name:        "GET not allowed",
+			name:        "GET-not-allowed",
 			method:      "GET",
 			grantType:   "authorization_code",
 			strictMode:  false,
 			expectError: true,
 		},
 		{
-			name:        "unsupported grant type",
+			name:        "unsupported-grant-type",
 			method:      "POST",
 			grantType:   "pkcs",
 			strictMode:  false,
 			expectError: true,
 		},
 		{
-			name:        "invalid code",
+			name:        "invalid-code",
 			method:      "POST",
 			grantType:   "authorization_code",
 			code:        "invalid-code",
@@ -518,7 +521,7 @@ func TestServeToken(t *testing.T) {
 			expectError: true,
 		},
 		{
-			name:        "omit code from form",
+			name:        "omit-code-from-form",
 			method:      "POST",
 			grantType:   "authorization_code",
 			omitCode:    true,
@@ -526,7 +529,7 @@ func TestServeToken(t *testing.T) {
 			expectError: true,
 		},
 		{
-			name:        "invalid redirect uri",
+			name:        "invalid-redirect-uri",
 			method:      "POST",
 			grantType:   "authorization_code",
 			code:        "valid-code",
@@ -536,7 +539,7 @@ func TestServeToken(t *testing.T) {
 			expectError: true,
 		},
 		{
-			name:        "invalid remoteAddr",
+			name:        "invalid-remoteAddr",
 			method:      "POST",
 			grantType:   "authorization_code",
 			redirectURI: "https://rp.example.com/callback",
@@ -546,7 +549,7 @@ func TestServeToken(t *testing.T) {
 			expectError: true,
 		},
 		{
-			name:        "extra claim included (non-strict)",
+			name:        "extra-claim-included-non-strict",
 			method:      "POST",
 			grantType:   "authorization_code",
 			redirectURI: "https://rp.example.com/callback",
@@ -554,7 +557,7 @@ func TestServeToken(t *testing.T) {
 			remoteAddr:  "127.0.0.1:12345",
 			strictMode:  false,
 			caps: tailcfg.PeerCapMap{
-				tailcfg.PeerCapabilityTsIDP: {
+				peercap.TsIDP: {
 					mustMarshalJSON(t, capRule{
 						IncludeInUserInfo: true,
 						ExtraClaims: map[string]any{
@@ -568,14 +571,15 @@ func TestServeToken(t *testing.T) {
 			},
 		},
 		{
-			name:        "attempt to overwrite protected claim (non-strict)",
+			// attempt to overwrite protected claim in non-strict mode
+			name:        "overwrite-protected-claim-non-strict",
 			method:      "POST",
 			grantType:   "authorization_code",
 			redirectURI: "https://rp.example.com/callback",
 			code:        "valid-code",
 			strictMode:  false,
 			caps: tailcfg.PeerCapMap{
-				tailcfg.PeerCapabilityTsIDP: {
+				peercap.TsIDP: {
 					mustMarshalJSON(t, capRule{
 						IncludeInUserInfo: true,
 						ExtraClaims: map[string]any{
@@ -708,10 +712,10 @@ func TestExtraUserInfo(t *testing.T) {
 		expectError    bool
 	}{
 		{
-			name:           "extra claim",
+			name:           "extra-claim",
 			tokenValidTill: time.Now().Add(1 * time.Minute),
 			caps: tailcfg.PeerCapMap{
-				tailcfg.PeerCapabilityTsIDP: {
+				peercap.TsIDP: {
 					mustMarshalJSON(t, capRule{
 						IncludeInUserInfo: true,
 						ExtraClaims: map[string]any{
@@ -725,10 +729,10 @@ func TestExtraUserInfo(t *testing.T) {
 			},
 		},
 		{
-			name:           "duplicate claim distinct values",
+			name:           "duplicate-claim-distinct-values",
 			tokenValidTill: time.Now().Add(1 * time.Minute),
 			caps: tailcfg.PeerCapMap{
-				tailcfg.PeerCapabilityTsIDP: {
+				peercap.TsIDP: {
 					mustMarshalJSON(t, capRule{
 						IncludeInUserInfo: true,
 						ExtraClaims: map[string]any{
@@ -742,10 +746,10 @@ func TestExtraUserInfo(t *testing.T) {
 			},
 		},
 		{
-			name:           "multiple extra claims",
+			name:           "multiple-extra-claims",
 			tokenValidTill: time.Now().Add(1 * time.Minute),
 			caps: tailcfg.PeerCapMap{
-				tailcfg.PeerCapabilityTsIDP: {
+				peercap.TsIDP: {
 					mustMarshalJSON(t, capRule{
 						IncludeInUserInfo: true,
 						ExtraClaims: map[string]any{
@@ -761,16 +765,16 @@ func TestExtraUserInfo(t *testing.T) {
 			},
 		},
 		{
-			name:           "empty extra claims",
+			name:           "empty-extra-claims",
 			caps:           tailcfg.PeerCapMap{},
 			tokenValidTill: time.Now().Add(1 * time.Minute),
 			expected:       map[string]any{},
 		},
 		{
-			name:           "attempt to overwrite protected claim",
+			name:           "overwrite-protected-claim",
 			tokenValidTill: time.Now().Add(1 * time.Minute),
 			caps: tailcfg.PeerCapMap{
-				tailcfg.PeerCapabilityTsIDP: {
+				peercap.TsIDP: {
 					mustMarshalJSON(t, capRule{
 						IncludeInUserInfo: true,
 						ExtraClaims: map[string]any{
@@ -783,10 +787,10 @@ func TestExtraUserInfo(t *testing.T) {
 			expectError: true,
 		},
 		{
-			name:           "extra claim omitted",
+			name:           "extra-claim-omitted",
 			tokenValidTill: time.Now().Add(1 * time.Minute),
 			caps: tailcfg.PeerCapMap{
-				tailcfg.PeerCapabilityTsIDP: {
+				peercap.TsIDP: {
 					mustMarshalJSON(t, capRule{
 						IncludeInUserInfo: false,
 						ExtraClaims: map[string]any{
@@ -798,7 +802,7 @@ func TestExtraUserInfo(t *testing.T) {
 			expected: map[string]any{},
 		},
 		{
-			name:           "expired token",
+			name:           "expired-token",
 			caps:           tailcfg.PeerCapMap{},
 			tokenValidTill: time.Now().Add(-1 * time.Minute),
 			expected:       map[string]any{},
@@ -1131,19 +1135,22 @@ func TestGetAllowInsecureRegistration(t *testing.T) {
 		expectAllowInsecureRegistration bool
 	}{
 		{
-			name:                            "flag explicitly set to false - insecure registration disabled (strict mode)",
+			// flag explicitly set to false - insecure registration disabled (strict mode)
+			name:                            "flag-false-insecure-disabled",
 			flagSet:                         true,
 			flagValue:                       false,
 			expectAllowInsecureRegistration: false,
 		},
 		{
-			name:                            "flag explicitly set to true - insecure registration enabled",
+			// flag explicitly set to true - insecure registration enabled
+			name:                            "flag-true-insecure-enabled",
 			flagSet:                         true,
 			flagValue:                       true,
 			expectAllowInsecureRegistration: true,
 		},
 		{
-			name:                            "flag unset - insecure registration enabled (default for backward compatibility)",
+			// flag unset - insecure registration enabled (default for backward compatibility)
+			name:                            "flag-unset-insecure-enabled-default",
 			flagSet:                         false,
 			flagValue:                       false, // not used when unset
 			expectAllowInsecureRegistration: true,
@@ -1192,7 +1199,7 @@ func TestMigrateOAuthClients(t *testing.T) {
 		expectOldRenamed    bool
 	}{
 		{
-			name:         "migrate from old file to new file",
+			name:         "migrate-old-to-new",
 			setupOldFile: true,
 			oldFileContent: map[string]*funnelClient{
 				"old-client": {
@@ -1206,7 +1213,7 @@ func TestMigrateOAuthClients(t *testing.T) {
 			expectOldRenamed:    true,
 		},
 		{
-			name:         "new file already exists - no migration",
+			name:         "new-file-exists-no-migration",
 			setupNewFile: true,
 			newFileContent: map[string]*funnelClient{
 				"existing-client": {
@@ -1220,12 +1227,12 @@ func TestMigrateOAuthClients(t *testing.T) {
 			expectOldRenamed:    false,
 		},
 		{
-			name:                "neither file exists - create empty new file",
+			name:                "neither-exists-create-empty",
 			expectNewFileExists: true,
 			expectOldRenamed:    false,
 		},
 		{
-			name:         "both files exist - prefer new file",
+			name:         "both-exist-prefer-new",
 			setupOldFile: true,
 			setupNewFile: true,
 			oldFileContent: map[string]*funnelClient{
@@ -1373,19 +1380,19 @@ func TestGetConfigFilePath(t *testing.T) {
 		expectError  bool
 	}{
 		{
-			name:        "file exists in current directory - use current directory",
+			name:        "file-in-cwd-use-cwd",
 			fileName:    "test-config.json",
 			createInCwd: true,
 			expectInCwd: true,
 		},
 		{
-			name:        "file does not exist - use root path",
+			name:        "file-missing-use-root",
 			fileName:    "test-config.json",
 			createInCwd: false,
 			expectInCwd: false,
 		},
 		{
-			name:         "file exists in both - prefer current directory",
+			name:         "file-in-both-prefer-cwd",
 			fileName:     "test-config.json",
 			createInCwd:  true,
 			createInRoot: true,
@@ -1472,7 +1479,7 @@ func TestAuthorizeStrictMode(t *testing.T) {
 	}{
 		// Security boundary test: funnel rejection
 		{
-			name:           "funnel requests are always rejected for security",
+			name:           "funnel-rejected",
 			strictMode:     true,
 			clientID:       "test-client",
 			redirectURI:    "https://rp.example.com/callback",
@@ -1487,7 +1494,7 @@ func TestAuthorizeStrictMode(t *testing.T) {
 
 		// Strict mode parameter validation tests (non-funnel)
 		{
-			name:        "strict mode - missing client_id",
+			name:        "strict-missing-client_id",
 			strictMode:  true,
 			clientID:    "",
 			redirectURI: "https://rp.example.com/callback",
@@ -1496,7 +1503,7 @@ func TestAuthorizeStrictMode(t *testing.T) {
 			expectCode:  http.StatusBadRequest,
 		},
 		{
-			name:        "strict mode - missing redirect_uri",
+			name:        "strict-missing-redirect_uri",
 			strictMode:  true,
 			clientID:    "test-client",
 			redirectURI: "",
@@ -1507,7 +1514,7 @@ func TestAuthorizeStrictMode(t *testing.T) {
 
 		// Strict mode client validation tests (non-funnel)
 		{
-			name:        "strict mode - invalid client_id",
+			name:        "strict-invalid-client_id",
 			strictMode:  true,
 			clientID:    "invalid-client",
 			redirectURI: "https://rp.example.com/callback",
@@ -1517,7 +1524,7 @@ func TestAuthorizeStrictMode(t *testing.T) {
 			expectCode:  http.StatusBadRequest,
 		},
 		{
-			name:           "strict mode - redirect_uri mismatch",
+			name:           "strict-redirect_uri-mismatch",
 			strictMode:     true,
 			clientID:       "test-client",
 			redirectURI:    "https://wrong.example.com/callback",
@@ -1666,7 +1673,7 @@ func TestServeTokenWithClientValidation(t *testing.T) {
 		expectIDToken       bool
 	}{
 		{
-			name:                "strict mode - valid token exchange with form credentials",
+			name:                "strict-token-exchange-form-creds",
 			strictMode:          true,
 			method:              "POST",
 			grantType:           "authorization_code",
@@ -1680,7 +1687,7 @@ func TestServeTokenWithClientValidation(t *testing.T) {
 			expectIDToken:       true,
 		},
 		{
-			name:                "strict mode - valid token exchange with basic auth",
+			name:                "strict-token-exchange-basic-auth",
 			strictMode:          true,
 			method:              "POST",
 			grantType:           "authorization_code",
@@ -1695,7 +1702,7 @@ func TestServeTokenWithClientValidation(t *testing.T) {
 			expectIDToken:       true,
 		},
 		{
-			name:                "strict mode - missing client credentials",
+			name:                "strict-missing-client-creds",
 			strictMode:          true,
 			method:              "POST",
 			grantType:           "authorization_code",
@@ -1708,7 +1715,7 @@ func TestServeTokenWithClientValidation(t *testing.T) {
 			expectCode:          http.StatusUnauthorized,
 		},
 		{
-			name:              "strict mode - client_id mismatch",
+			name:              "strict-client_id-mismatch",
 			strictMode:        true,
 			method:            "POST",
 			grantType:         "authorization_code",
@@ -1722,7 +1729,7 @@ func TestServeTokenWithClientValidation(t *testing.T) {
 			expectCode:        http.StatusBadRequest,
 		},
 		{
-			name:                "strict mode - invalid client secret",
+			name:                "strict-invalid-client-secret",
 			strictMode:          true,
 			method:              "POST",
 			grantType:           "authorization_code",
@@ -1737,7 +1744,7 @@ func TestServeTokenWithClientValidation(t *testing.T) {
 			expectCode:          http.StatusUnauthorized,
 		},
 		{
-			name:                "strict mode - redirect_uri mismatch",
+			name:                "strict-redirect_uri-mismatch",
 			strictMode:          true,
 			method:              "POST",
 			grantType:           "authorization_code",
@@ -1752,7 +1759,7 @@ func TestServeTokenWithClientValidation(t *testing.T) {
 			expectCode:          http.StatusBadRequest,
 		},
 		{
-			name:                "non-strict mode - no client validation required",
+			name:                "non-strict-no-client-validation",
 			strictMode:          false,
 			method:              "POST",
 			grantType:           "authorization_code",
@@ -1913,7 +1920,7 @@ func TestServeUserInfoWithClientValidation(t *testing.T) {
 		expectUserInfo bool
 	}{
 		{
-			name:           "strict mode - valid token with existing client",
+			name:           "strict-valid-token-existing-client",
 			strictMode:     true,
 			setupToken:     true,
 			setupClient:    true,
@@ -1923,7 +1930,8 @@ func TestServeUserInfoWithClientValidation(t *testing.T) {
 			expectUserInfo: true,
 		},
 		{
-			name:           "strict mode - valid token but client no longer exists",
+			// valid token but client no longer exists
+			name:           "strict-token-client-deleted",
 			strictMode:     true,
 			setupToken:     true,
 			setupClient:    false,
@@ -1934,7 +1942,7 @@ func TestServeUserInfoWithClientValidation(t *testing.T) {
 			expectCode:     http.StatusUnauthorized,
 		},
 		{
-			name:           "strict mode - expired token",
+			name:           "strict-expired-token",
 			strictMode:     true,
 			setupToken:     true,
 			setupClient:    true,
@@ -1945,7 +1953,7 @@ func TestServeUserInfoWithClientValidation(t *testing.T) {
 			expectCode:     http.StatusBadRequest,
 		},
 		{
-			name:        "strict mode - invalid token",
+			name:        "strict-invalid-token",
 			strictMode:  true,
 			setupToken:  false,
 			token:       "invalid-token",
@@ -1953,7 +1961,7 @@ func TestServeUserInfoWithClientValidation(t *testing.T) {
 			expectCode:  http.StatusBadRequest,
 		},
 		{
-			name:           "strict mode - token without client association",
+			name:           "strict-token-no-client-assoc",
 			strictMode:     true,
 			setupToken:     true,
 			setupClient:    false,
@@ -1964,7 +1972,7 @@ func TestServeUserInfoWithClientValidation(t *testing.T) {
 			expectCode:     http.StatusBadRequest,
 		},
 		{
-			name:           "non-strict mode - no client validation required",
+			name:           "non-strict-no-client-validation",
 			strictMode:     false,
 			setupToken:     true,
 			setupClient:    false,

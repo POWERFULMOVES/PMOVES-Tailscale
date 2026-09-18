@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 // Package tpm implements support for TPM 2.0 devices.
@@ -35,12 +35,17 @@ import (
 	"tailscale.com/util/testenv"
 )
 
-var infoOnce = sync.OnceValue(info)
+var (
+	infoOnce         = sync.OnceValue(info)
+	tpmSupportedOnce = sync.OnceValue(tpmSupported)
+)
 
 func init() {
-	feature.Register("tpm")
-	feature.HookTPMAvailable.Set(tpmSupported)
-	feature.HookHardwareAttestationAvailable.Set(tpmSupported)
+	if !feature.Register("tpm") {
+		return
+	}
+	feature.HookTPMAvailable.Set(tpmSupportedOnce)
+	feature.HookHardwareAttestationAvailable.Set(tpmSupportedOnce)
 
 	hostinfo.RegisterHostinfoNewHook(func(hi *tailcfg.Hostinfo) {
 		hi.TPM = infoOnce()
@@ -240,8 +245,11 @@ func (s *tpmStore) WriteState(k ipn.StateKey, bs []byte) error {
 	if bytes.Equal(s.cache[k], bs) {
 		return nil
 	}
-	s.cache[k] = bytes.Clone(bs)
-
+	if bs == nil {
+		delete(s.cache, k)
+	} else {
+		s.cache[k] = bytes.Clone(bs)
+	}
 	return s.writeSealed()
 }
 
@@ -411,6 +419,9 @@ func tpmSeal(logf logger.Logf, data []byte) (*tpmSealedData, error) {
 					FixedTPM:     true,
 					FixedParent:  true,
 					UserWithAuth: true,
+					// We don't set an authorization policy on this key, so DA
+					// isn't helpful.
+					NoDA: true,
 				},
 			}),
 		}

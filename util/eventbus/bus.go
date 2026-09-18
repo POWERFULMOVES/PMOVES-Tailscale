@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 package eventbus
@@ -8,8 +8,8 @@ import (
 	"log"
 	"reflect"
 	"slices"
-	"sync"
 
+	"tailscale.com/syncs"
 	"tailscale.com/types/logger"
 	"tailscale.com/util/set"
 )
@@ -34,12 +34,12 @@ type Bus struct {
 	routeDebug hook[RoutedEvent]
 	logf       logger.Logf
 
-	topicsMu sync.Mutex
+	topicsMu syncs.Mutex
 	topics   map[reflect.Type][]*subscribeState
 
 	// Used for introspection/debugging only, not in the normal event
 	// publishing path.
-	clientsMu sync.Mutex
+	clientsMu syncs.Mutex
 	clients   set.Set[*Client]
 }
 
@@ -103,6 +103,15 @@ func (b *Bus) Debugger() *Debugger {
 	return &Debugger{b}
 }
 
+// ProbeLocks acquires and releases the bus's internal mutexes.
+func (b *Bus) ProbeLocks() {
+	b.topicsMu.Lock()
+	b.topicsMu.Unlock()
+
+	b.clientsMu.Lock()
+	b.clientsMu.Unlock()
+}
+
 // Close closes the bus. It implicitly closes all clients, publishers and
 // subscribers attached to the bus.
 //
@@ -120,7 +129,14 @@ func (b *Bus) Close() {
 }
 
 func (b *Bus) pump(ctx context.Context) {
-	var vals queue[PublishedEvent]
+	// Limit how many published events we can buffer in the PublishedEvent queue.
+	//
+	// Subscribers have unbounded DeliveredEvent queues (see tailscale/tailscale#18020),
+	// so this queue doesn't need to be unbounded. Keeping it bounded may also help
+	// catch cases where subscribers stop pumping events completely, such as due to a bug
+	// in [subscribeState.pump], [Subscriber.dispatch], or [SubscriberFunc.dispatch]).
+	const maxPublishedEvents = 16
+	vals := queue[PublishedEvent]{capacity: maxPublishedEvents}
 	acceptCh := func() chan PublishedEvent {
 		if vals.Full() {
 			return nil
@@ -134,7 +150,7 @@ func (b *Bus) pump(ctx context.Context) {
 		// queue space for it.
 		for !vals.Empty() {
 			val := vals.Peek()
-			dests := b.dest(reflect.ValueOf(val.Event).Type())
+			dests := b.dest(reflect.TypeOf(val.Event))
 
 			if b.routeDebug.active() {
 				clients := make([]*Client, len(dests))
@@ -306,7 +322,7 @@ func (w *worker) StopAndWait() {
 type stopFlag struct {
 	// guards the lazy construction of stopped, and the value of
 	// alreadyStopped.
-	mu             sync.Mutex
+	mu             syncs.Mutex
 	stopped        chan struct{}
 	alreadyStopped bool
 }

@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 package derp
@@ -33,6 +33,7 @@ type Client struct {
 	meshKey     key.DERPMesh
 	canAckPings bool
 	isProber    bool
+	appName     string
 
 	wmu  sync.Mutex // hold while writing to bw
 	bw   *bufio.Writer
@@ -60,6 +61,7 @@ type clientOpt struct {
 	ServerPub   key.NodePublic
 	CanAckPings bool
 	IsProber    bool
+	AppName     string
 }
 
 // MeshKey returns a ClientOpt to pass to the DERP server during connect to get
@@ -69,7 +71,7 @@ type clientOpt struct {
 func MeshKey(k key.DERPMesh) ClientOpt { return clientOptFunc(func(o *clientOpt) { o.MeshKey = k }) }
 
 // IsProber returns a ClientOpt to pass to the DERP server during connect to
-// declare that this client is a a prober.
+// declare that this client is a prober.
 func IsProber(v bool) ClientOpt { return clientOptFunc(func(o *clientOpt) { o.IsProber = v }) }
 
 // ServerPublicKey returns a ClientOpt to declare that the server's DERP public key is known.
@@ -84,6 +86,31 @@ func CanAckPings(v bool) ClientOpt {
 	return clientOptFunc(func(o *clientOpt) { o.CanAckPings = v })
 }
 
+// AppName returns a ClientOpt to set an opaque app name string to
+// advertise to the DERP server for stats purposes. It is sent to the
+// server in the ClientInfo. The name must be valid per [ValidAppName]
+// or NewClient returns an error.
+func AppName(name string) ClientOpt {
+	return clientOptFunc(func(o *clientOpt) { o.AppName = name })
+}
+
+// MaxAppNameLen is the maximum length in bytes of a [ClientInfo.AppName].
+const MaxAppNameLen = 32
+
+// ValidAppName reports whether name is a valid app name: at most
+// [MaxAppNameLen] bytes of printable ASCII. The empty string is valid.
+func ValidAppName(name string) bool {
+	if len(name) > MaxAppNameLen {
+		return false
+	}
+	for i := range len(name) {
+		if b := name[i]; b < ' ' || b > '~' {
+			return false
+		}
+	}
+	return true
+}
+
 func NewClient(privateKey key.NodePrivate, nc Conn, brw *bufio.ReadWriter, logf logger.Logf, opts ...ClientOpt) (*Client, error) {
 	var opt clientOpt
 	for _, o := range opts {
@@ -91,6 +118,9 @@ func NewClient(privateKey key.NodePrivate, nc Conn, brw *bufio.ReadWriter, logf 
 			return nil, errors.New("nil ClientOpt")
 		}
 		o.update(&opt)
+	}
+	if !ValidAppName(opt.AppName) {
+		return nil, fmt.Errorf("invalid AppName %.40q", opt.AppName)
 	}
 	return newClient(privateKey, nc, brw, logf, opt)
 }
@@ -106,6 +136,7 @@ func newClient(privateKey key.NodePrivate, nc Conn, brw *bufio.ReadWriter, logf 
 		meshKey:     opt.MeshKey,
 		canAckPings: opt.CanAckPings,
 		isProber:    opt.IsProber,
+		appName:     opt.AppName,
 		clock:       tstime.StdClock{},
 	}
 	if opt.ServerPub.IsZero() {
@@ -167,7 +198,7 @@ type ClientInfo struct {
 	// trusted clients.  It's required to subscribe to the
 	// connection list & forward packets. It's empty for regular
 	// users.
-	MeshKey key.DERPMesh `json:"meshKey,omitempty,omitzero"`
+	MeshKey key.DERPMesh `json:"meshKey,omitzero"`
 
 	// Version is the DERP protocol version that the client was built with.
 	// See the ProtocolVersion const.
@@ -179,6 +210,12 @@ type ClientInfo struct {
 
 	// IsProber is whether this client is a prober.
 	IsProber bool `json:",omitempty"`
+
+	// AppName is an optional opaque app name string the client
+	// advertises to the server for stats purposes. It must be
+	// valid per [ValidAppName] or the server rejects the
+	// connection.
+	AppName string `json:",omitempty"`
 }
 
 // Equal reports if two clientInfo values are equal.
@@ -186,7 +223,7 @@ func (c *ClientInfo) Equal(other *ClientInfo) bool {
 	if c == nil || other == nil {
 		return c == other
 	}
-	if c.Version != other.Version || c.CanAckPings != other.CanAckPings || c.IsProber != other.IsProber {
+	if c.Version != other.Version || c.CanAckPings != other.CanAckPings || c.IsProber != other.IsProber || c.AppName != other.AppName {
 		return false
 	}
 	return c.MeshKey.Equal(other.MeshKey)
@@ -198,6 +235,7 @@ func (c *Client) sendClientKey() error {
 		MeshKey:     c.meshKey,
 		CanAckPings: c.canAckPings,
 		IsProber:    c.isProber,
+		AppName:     c.appName,
 	})
 	if err != nil {
 		return err
@@ -394,6 +432,10 @@ type PeerPresentMessage struct {
 	IPPort netip.AddrPort
 	// Flags is a bitmask of info about the client.
 	Flags PeerPresentFlags
+	// AppName is the optional app name the client advertised in
+	// its ClientInfo, if any. It's empty if the client didn't
+	// send one or the server is too old to relay it.
+	AppName string
 }
 
 func (PeerPresentMessage) msg() {}
@@ -554,7 +596,7 @@ func (c *Client) recvTimeout(timeout time.Duration) (m ReceivedMessage, err erro
 			return sm, nil
 		case FrameKeepAlive:
 			// A one-way keep-alive message that doesn't require an acknowledgement.
-			// This predated framePing/framePong.
+			// This predated FramePing/FramePong.
 			return KeepAliveMessage{}, nil
 		case FramePeerGone:
 			if n < KeyLen {
@@ -594,12 +636,27 @@ func (c *Client) recvTimeout(timeout time.Duration) (m ReceivedMessage, err erro
 				binary.BigEndian.Uint16(chunk[ipLen:]),
 			)
 
-			chunk, _, ok = cutLeadingN(remain, 1)
+			chunk, remain, ok = cutLeadingN(remain, 1)
 			if !ok {
 				// Older server which doesn't send PeerPresentFlags.
 				return msg, nil
 			}
 			msg.Flags = PeerPresentFlags(chunk[0])
+
+			chunk, remain, ok = cutLeadingN(remain, 1)
+			if !ok {
+				// Older server which doesn't send the app name.
+				return msg, nil
+			}
+			nameLen := int(chunk[0])
+			chunk, _, ok = cutLeadingN(remain, nameLen)
+			if !ok {
+				c.logf("[unexpected] short peerPresent app name from DERP server")
+				return msg, nil
+			}
+			if name := string(chunk); ValidAppName(name) {
+				msg.AppName = name
+			}
 			return msg, nil
 
 		case FrameRecvPacket:

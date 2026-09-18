@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 package ts2021
@@ -7,6 +7,7 @@ import (
 	"bytes"
 	"cmp"
 	"context"
+	"crypto/x509"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -28,6 +29,7 @@ import (
 	"tailscale.com/tstime"
 	"tailscale.com/types/key"
 	"tailscale.com/types/logger"
+	"tailscale.com/util/httpbody"
 	"tailscale.com/util/mak"
 	"tailscale.com/util/set"
 )
@@ -85,6 +87,9 @@ type ClientOpts struct {
 
 	// HealthTracker, if non-nil, is the health tracker to use.
 	HealthTracker *health.Tracker
+
+	// ExtraRootCAs, if non-nil, specifies additional trusted root CAs for TLS.
+	ExtraRootCAs *x509.CertPool
 
 	// DialPlan, if set, is a function that should return an explicit plan
 	// on how to connect to the server.
@@ -252,6 +257,7 @@ func (nc *Client) dial(ctx context.Context) (*Conn, error) {
 		Logf:            nc.logf,
 		NetMon:          nc.opts.NetMon,
 		HealthTracker:   nc.opts.HealthTracker,
+		ExtraRootCAs:    nc.opts.ExtraRootCAs,
 		Clock:           tstime.StdClock{},
 	}
 	clientConn, err := chd.Dial(ctx)
@@ -309,4 +315,23 @@ func AddLBHeader(req *http.Request, nodeKey key.NodePublic) {
 	if !nodeKey.IsZero() {
 		req.Header.Add(tailcfg.LBHeader, nodeKey.String())
 	}
+}
+
+// Do does req against the control server and caps the response body with
+// httpbody.LimitSize, using the size limit in the request's context per
+// [httpbody.WithMaxSize], [httpbody.DefaultMaxSize] by default, so a
+// malicious or buggy control server cannot make us buffer an unbounded
+// response body. Reads past the cap fail with an error wrapping
+// [httpbody.ErrTooLarge] rather than silently truncating.
+//
+// It shadows the embedded http.Client's Do method, so all noise requests,
+// including those made with [Client.Post] and [Client.DoWithBody], get the
+// cap.
+func (nc *Client) Do(req *http.Request) (*http.Response, error) {
+	res, err := nc.Client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	httpbody.LimitSize(res)
+	return res, nil
 }

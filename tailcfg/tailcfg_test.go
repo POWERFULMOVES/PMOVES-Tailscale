@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 package tailcfg_test
@@ -13,17 +13,18 @@ import (
 	"testing"
 	"time"
 
+	"tailscale.com/ipn/ipnstate"
 	. "tailscale.com/tailcfg"
+	"tailscale.com/tailcfg/peercap"
 	"tailscale.com/tstest/deptest"
 	"tailscale.com/types/key"
 	"tailscale.com/types/opt"
-	"tailscale.com/types/ptr"
 	"tailscale.com/util/must"
 )
 
 func fieldsOf(t reflect.Type) (fields []string) {
-	for i := range t.NumField() {
-		fields = append(fields, t.Field(i).Name)
+	for field := range t.Fields() {
+		fields = append(fields, field.Name)
 	}
 	return
 }
@@ -49,6 +50,7 @@ func TestHostinfoEqual(t *testing.T) {
 		"ShieldsUp",
 		"ShareeNode",
 		"NoLogsNoSupport",
+		"RemoteConfig",
 		"WireIngress",
 		"IngressEnabled",
 		"AllowsUpdate",
@@ -67,6 +69,7 @@ func TestHostinfoEqual(t *testing.T) {
 		"UserspaceRouter",
 		"AppConnector",
 		"ServicesHash",
+		"PeerRelay",
 		"ExitNodeID",
 		"Location",
 		"TPM",
@@ -245,6 +248,16 @@ func TestHostinfoEqual(t *testing.T) {
 			false,
 		},
 		{
+			&Hostinfo{PeerRelay: true},
+			&Hostinfo{PeerRelay: true},
+			true,
+		},
+		{
+			&Hostinfo{PeerRelay: true},
+			&Hostinfo{PeerRelay: false},
+			false,
+		},
+		{
 			&Hostinfo{ServicesHash: "73475cb40a568e8da8a045ced110137e159f890ac4da883b6b17dc651b3a8049"},
 			&Hostinfo{ServicesHash: "73475cb40a568e8da8a045ced110137e159f890ac4da883b6b17dc651b3a8049"},
 			true,
@@ -337,6 +350,7 @@ func TestNodeEqual(t *testing.T) {
 		"ComputedName", "computedHostIfDifferent", "ComputedNameWithHost",
 		"DataPlaneAuditLogID", "Expired", "SelfNodeV4MasqAddrForThisPeer",
 		"SelfNodeV6MasqAddrForThisPeer", "IsWireGuardOnly", "IsJailed", "ExitNodeDNSResolvers",
+		"StableTailnetID",
 	}
 	if have := fieldsOf(reflect.TypeFor[Node]()); !reflect.DeepEqual(have, nodeHandles) {
 		t.Errorf("Node.Equal check might be out of sync\nfields: %q\nhandled: %q\n",
@@ -389,6 +403,21 @@ func TestNodeEqual(t *testing.T) {
 		{
 			&Node{StableID: "node-abcd"},
 			&Node{StableID: "node-abcd"},
+			true,
+		},
+		{
+			&Node{StableTailnetID: "tailnet-abcd"},
+			&Node{},
+			false,
+		},
+		{
+			&Node{StableTailnetID: "tailnet-abcd"},
+			&Node{StableTailnetID: "tailnet-efgh"},
+			false,
+		},
+		{
+			&Node{StableTailnetID: "tailnet-abcd"},
+			&Node{StableTailnetID: "tailnet-abcd"},
 			true,
 		},
 		{
@@ -528,22 +557,22 @@ func TestNodeEqual(t *testing.T) {
 		},
 		{
 			&Node{},
-			&Node{SelfNodeV4MasqAddrForThisPeer: ptr.To(netip.MustParseAddr("100.64.0.1"))},
+			&Node{SelfNodeV4MasqAddrForThisPeer: new(netip.MustParseAddr("100.64.0.1"))},
 			false,
 		},
 		{
-			&Node{SelfNodeV4MasqAddrForThisPeer: ptr.To(netip.MustParseAddr("100.64.0.1"))},
-			&Node{SelfNodeV4MasqAddrForThisPeer: ptr.To(netip.MustParseAddr("100.64.0.1"))},
+			&Node{SelfNodeV4MasqAddrForThisPeer: new(netip.MustParseAddr("100.64.0.1"))},
+			&Node{SelfNodeV4MasqAddrForThisPeer: new(netip.MustParseAddr("100.64.0.1"))},
 			true,
 		},
 		{
 			&Node{},
-			&Node{SelfNodeV6MasqAddrForThisPeer: ptr.To(netip.MustParseAddr("2001::3456"))},
+			&Node{SelfNodeV6MasqAddrForThisPeer: new(netip.MustParseAddr("2001::3456"))},
 			false,
 		},
 		{
-			&Node{SelfNodeV6MasqAddrForThisPeer: ptr.To(netip.MustParseAddr("2001::3456"))},
-			&Node{SelfNodeV6MasqAddrForThisPeer: ptr.To(netip.MustParseAddr("2001::3456"))},
+			&Node{SelfNodeV6MasqAddrForThisPeer: new(netip.MustParseAddr("2001::3456"))},
+			&Node{SelfNodeV6MasqAddrForThisPeer: new(netip.MustParseAddr("2001::3456"))},
 			true,
 		},
 		{
@@ -602,6 +631,200 @@ func TestNodeEqual(t *testing.T) {
 			t.Errorf("%d. Equal = %v; want %v", i, got, tt.want)
 		}
 	}
+}
+
+var nodeIsRouterCases = []struct {
+	name string
+	node Node
+	want bool
+}{
+	{
+		name: "empty",
+		node: Node{},
+		want: false,
+	},
+	{
+		name: "too-few-allowedips",
+		node: Node{
+			Addresses: []netip.Prefix{
+				netip.MustParsePrefix("100.64.0.1/32"),
+			},
+			AllowedIPs: []netip.Prefix{},
+		},
+		want: false,
+	},
+	{
+		name: "duplicates",
+		node: Node{
+			Addresses: []netip.Prefix{
+				netip.MustParsePrefix("100.64.0.1/32"),
+			},
+			AllowedIPs: []netip.Prefix{
+				netip.MustParsePrefix("100.64.0.1/32"),
+				netip.MustParsePrefix("100.64.0.1/32"),
+			},
+		},
+		want: false,
+	},
+	{
+		name: "plain-ipv4",
+		node: Node{
+			Addresses: []netip.Prefix{
+				netip.MustParsePrefix("100.64.0.1/32"),
+			},
+			AllowedIPs: []netip.Prefix{
+				netip.MustParsePrefix("100.64.0.1/32"),
+			},
+		},
+		want: false,
+	},
+	{
+		name: "plain-ipv6",
+		node: Node{
+			Addresses: []netip.Prefix{
+				netip.MustParsePrefix("fd7a:115c:a1e0::1/128"),
+			},
+			AllowedIPs: []netip.Prefix{
+				netip.MustParsePrefix("fd7a:115c:a1e0::1/128"),
+			},
+		},
+		want: false,
+	},
+	{
+		name: "plain-ipv4-ipv6",
+		node: Node{
+			Addresses: []netip.Prefix{
+				netip.MustParsePrefix("100.64.0.1/32"),
+				netip.MustParsePrefix("fd7a:115c:a1e0::1/128"),
+			},
+			AllowedIPs: []netip.Prefix{
+				netip.MustParsePrefix("100.64.0.1/32"),
+				netip.MustParsePrefix("fd7a:115c:a1e0::1/128"),
+			},
+		},
+		want: false,
+	},
+	{
+		name: "exit-node-ipv4",
+		node: Node{
+			Addresses: []netip.Prefix{
+				netip.MustParsePrefix("100.64.0.1/32"),
+			},
+			AllowedIPs: []netip.Prefix{
+				netip.MustParsePrefix("100.64.0.1/32"),
+				netip.MustParsePrefix("0.0.0.0/0"),
+			},
+		},
+		want: true,
+	},
+	{
+		name: "exit-node-ipv6",
+		node: Node{
+			Addresses: []netip.Prefix{
+				netip.MustParsePrefix("fd7a:115c:a1e0::1/128"),
+			},
+			AllowedIPs: []netip.Prefix{
+				netip.MustParsePrefix("fd7a:115c:a1e0::1/128"),
+				netip.MustParsePrefix("::/0"),
+			},
+		},
+		want: true,
+	},
+	{
+		name: "exit-node-ipv4-ipv6",
+		node: Node{
+			Addresses: []netip.Prefix{
+				netip.MustParsePrefix("100.64.0.1/32"),
+				netip.MustParsePrefix("fd7a:115c:a1e0::1/128"),
+			},
+			AllowedIPs: []netip.Prefix{
+				netip.MustParsePrefix("100.64.0.1/32"),
+				netip.MustParsePrefix("fd7a:115c:a1e0::1/128"),
+				netip.MustParsePrefix("0.0.0.0/0"),
+				netip.MustParsePrefix("::/0"),
+			},
+		},
+		want: true,
+	},
+	{
+		name: "subnet-router-ipv4",
+		node: Node{
+			Addresses: []netip.Prefix{
+				netip.MustParsePrefix("100.64.0.1/32"),
+			},
+			AllowedIPs: []netip.Prefix{
+				netip.MustParsePrefix("100.64.0.1/32"),
+				netip.MustParsePrefix("192.0.2.0/24"),
+			},
+		},
+		want: true,
+	},
+	{
+		name: "subnet-router-ipv6",
+		node: Node{
+			Addresses: []netip.Prefix{
+				netip.MustParsePrefix("fd7a:115c:a1e0::1/128"),
+			},
+			AllowedIPs: []netip.Prefix{
+				netip.MustParsePrefix("fd7a:115c:a1e0::1/128"),
+				netip.MustParsePrefix("2001:db8::/32"),
+			},
+		},
+		want: true,
+	},
+	{
+		name: "subnet-router-ipv4-ipv6",
+		node: Node{
+			Addresses: []netip.Prefix{
+				netip.MustParsePrefix("100.64.0.1/32"),
+				netip.MustParsePrefix("fd7a:115c:a1e0::1/128"),
+			},
+			AllowedIPs: []netip.Prefix{
+				netip.MustParsePrefix("100.64.0.1/32"),
+				netip.MustParsePrefix("fd7a:115c:a1e0::1/128"),
+				netip.MustParsePrefix("192.0.2.0/24"),
+				netip.MustParsePrefix("2001:db8::/32"),
+			},
+		},
+		want: true,
+	},
+}
+
+func TestNodeIsRouter(t *testing.T) {
+	for _, tc := range nodeIsRouterCases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := tc.node.IsRouter(); got != tc.want {
+				t.Errorf("node: got %t, want %t", got, tc.want)
+			}
+
+			nv := tc.node.View()
+			if got := nv.IsRouter(); got != tc.want {
+				t.Errorf("view: got %t, want %t", got, tc.want)
+			}
+
+			// Check that [ipnstate.PeerStatus.IsRouter] matches.
+			ps := peerStatusFromNode(nv)
+			if got := ps.IsRouter(); got != tc.want {
+				t.Errorf("peer status: got %t, want %t", got, tc.want)
+			}
+		})
+	}
+}
+
+func peerStatusFromNode(n NodeView) *ipnstate.PeerStatus {
+	ps := &ipnstate.PeerStatus{
+		ID:        n.StableID(),
+		NodeID:    n.ID(),
+		PublicKey: n.Key(),
+		DNSName:   n.Name(),
+	}
+	for _, p := range n.Addresses().All() {
+		if p.IsSingleIP() {
+			ps.TailscaleIPs = append(ps.TailscaleIPs, p.Addr())
+		}
+	}
+	ps.AllowedIPs = new(n.AllowedIPs())
+	return ps
 }
 
 func TestNetInfoFields(t *testing.T) {
@@ -817,28 +1040,28 @@ func TestMarshalToRawMessageAndBack(t *testing.T) {
 		Ports    []int            `json:"ports,omitempty"`
 		ToggleOn bool             `json:"toggleOn,omitempty"`
 		Name     string           `json:"name,omitempty"`
-		Groups   inner            `json:"groups,omitempty"`
+		Groups   inner            `json:"groups"`
 		Addrs    []netip.AddrPort `json:"addrs"`
 	}
 	tests := []struct {
 		name    string
-		capType PeerCapability
+		capType peercap.Cap
 		val     testRule
 	}{
 		{
 			name:    "empty",
 			val:     testRule{},
-			capType: PeerCapability("foo"),
+			capType: peercap.Cap("foo"),
 		},
 		{
-			name:    "some values",
+			name:    "some-values",
 			val:     testRule{Ports: []int{80, 443}, Name: "foo"},
-			capType: PeerCapability("foo"),
+			capType: peercap.Cap("foo"),
 		},
 		{
-			name:    "all values",
+			name:    "all-values",
 			val:     testRule{Ports: []int{80, 443}, Name: "foo", ToggleOn: true, Groups: inner{Groups: []string{"foo", "bar"}}, Addrs: []netip.AddrPort{testip}},
-			capType: PeerCapability("foo"),
+			capType: peercap.Cap("foo"),
 		},
 	}
 	for _, tc := range tests {
@@ -1021,5 +1244,60 @@ func TestDisplayMessageEqual(t *testing.T) {
 				t.Errorf("value1.Equal(value2): got %t, want %t\nvalue1:\n%s\nvalue2:\n%s", got, test.wantEqual, value1, value2)
 			}
 		})
+	}
+}
+
+func TestServiceActionTypeValid(t *testing.T) {
+	tests := []struct {
+		typ  ServiceActionType
+		want bool
+	}{
+		{ServiceActionTypeAWSS3, true},
+		{ServiceActionTypeCockroachDB, true},
+		{ServiceActionTypeElasticSearch, true},
+		{ServiceActionTypeHTTP, true},
+		{ServiceActionTypeKubernetes, true},
+		{ServiceActionTypeMongoDB, true},
+		{ServiceActionTypeMSSQL, true},
+		{ServiceActionTypeMySQL, true},
+		{ServiceActionTypePostgreSQL, true},
+		{ServiceActionTypeRDP, true},
+		{ServiceActionTypeVNC, true},
+		{ServiceActionTypeSSH, true},
+		{ServiceActionTypeTCP, true},
+		{"ftp", false},
+		{"", false},
+	}
+	for _, tt := range tests {
+		if got := tt.typ.Valid(); got != tt.want {
+			t.Errorf("ServiceActionType(%q).Valid() = %v, want %v", tt.typ, got, tt.want)
+		}
+	}
+}
+
+// TestSSHActionJSON verifies that SSHAction round-trips through
+// encoding/json with SessionDuration encoded as int64 nanoseconds.
+// It notably guards against jsonv2 `format` tag options in struct
+// tags, which Go 1.27's encoding/json rejects at runtime.
+// See https://github.com/tailscale/tailscale/issues/20528.
+func TestSSHActionJSON(t *testing.T) {
+	a := SSHAction{
+		Accept:          true,
+		SessionDuration: 5 * time.Second,
+	}
+	got, err := json.Marshal(a)
+	if err != nil {
+		t.Fatalf("Marshal: %v", err)
+	}
+	const want = `{"accept":true,"sessionDuration":5000000000}`
+	if string(got) != want {
+		t.Errorf("Marshal = %s; want %s", got, want)
+	}
+	var back SSHAction
+	if err := json.Unmarshal(got, &back); err != nil {
+		t.Fatalf("Unmarshal: %v", err)
+	}
+	if !reflect.DeepEqual(back, a) {
+		t.Errorf("round trip = %+v; want %+v", back, a)
 	}
 }

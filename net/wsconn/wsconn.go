@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 // Package wsconn contains an adapter type that turns
@@ -12,11 +12,11 @@ import (
 	"math"
 	"net"
 	"os"
-	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/coder/websocket"
+	"tailscale.com/syncs"
 )
 
 // NetConn converts a *websocket.Conn into a net.Conn.
@@ -102,7 +102,7 @@ type netConn struct {
 	reading           atomic.Bool
 	afterReadDeadline atomic.Bool
 
-	readMu sync.Mutex
+	readMu syncs.Mutex
 	// eofed is true if the reader should return io.EOF from the Read call.
 	//
 	// +checklocks:readMu

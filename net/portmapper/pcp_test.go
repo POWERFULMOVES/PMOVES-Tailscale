@@ -1,9 +1,10 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 package portmapper
 
 import (
+	"bytes"
 	"encoding/binary"
 	"net/netip"
 	"testing"
@@ -24,6 +25,9 @@ func TestParsePCPMapResponse(t *testing.T) {
 	expectedAddr := netip.MustParseAddrPort("135.180.175.246:1234")
 	if mapping.external != expectedAddr {
 		t.Errorf("mismatched external address, got: %v, want: %v", mapping.external, expectedAddr)
+	}
+	if got, want := mapping.nonce[:], examplePCPMapResponse[24:36]; !bytes.Equal(got, want) {
+		t.Errorf("mismatched nonce, got: %x, want: %x", got, want)
 	}
 }
 

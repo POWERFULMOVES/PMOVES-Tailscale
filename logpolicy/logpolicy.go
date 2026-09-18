@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 // Package logpolicy manages the creation or reuse of logtail loggers,
@@ -43,6 +43,7 @@ import (
 	"tailscale.com/net/netknob"
 	"tailscale.com/net/netmon"
 	"tailscale.com/net/netns"
+	"tailscale.com/net/netutil"
 	"tailscale.com/net/netx"
 	"tailscale.com/net/tlsdial"
 	"tailscale.com/paths"
@@ -53,12 +54,14 @@ import (
 	"tailscale.com/util/eventbus"
 	"tailscale.com/util/must"
 	"tailscale.com/util/racebuild"
-	"tailscale.com/util/syspolicy/pkey"
-	"tailscale.com/util/syspolicy/policyclient"
 	"tailscale.com/util/testenv"
 	"tailscale.com/version"
 	"tailscale.com/version/distro"
 )
+
+// GetLogTarget is an optional hook to register a function
+// that returns the log target URL to be used by logpolicy.
+var GetLogTarget feature.Hook[func() string]
 
 var getLogTargetOnce struct {
 	sync.Once
@@ -67,8 +70,12 @@ var getLogTargetOnce struct {
 
 func getLogTarget() string {
 	getLogTargetOnce.Do(func() {
-		envTarget, _ := os.LookupEnv("TS_LOG_TARGET")
-		getLogTargetOnce.v, _ = policyclient.Get().GetString(pkey.LogTarget, envTarget)
+		if f, ok := GetLogTarget.GetOk(); ok {
+			getLogTargetOnce.v = f()
+		}
+		if getLogTargetOnce.v == "" {
+			getLogTargetOnce.v, _ = os.LookupEnv("TS_LOG_TARGET")
+		}
 	})
 
 	return getLogTargetOnce.v
@@ -193,8 +200,8 @@ type logWriter struct {
 	logger *log.Logger
 }
 
-func (l logWriter) Write(buf []byte) (int, error) {
-	l.logger.Printf("%s", buf)
+func (lg logWriter) Write(buf []byte) (int, error) {
+	lg.logger.Printf("%s", buf)
 	return len(buf), nil
 }
 
@@ -539,7 +546,18 @@ func (opts Options) init(disableLogging bool) (*logtail.Config, *Policy) {
 		// anyway, no need to add one.
 		lflags = 0
 	}
-	console := log.New(stderrWriter{}, "", lflags)
+	var conWriter io.Writer = stderrWriter{}
+	if buildfeatures.HasSyslog {
+		if f, ok := feature.HookLogSink.GetOk(); ok {
+			if w := f(); w != nil {
+				// Logs are being redirected elsewhere (e.g. to syslog,
+				// which records its own timestamps).
+				conWriter = w
+				lflags = 0
+			}
+		}
+	}
+	console := log.New(conWriter, "", lflags)
 
 	var earlyErrBuf bytes.Buffer
 	earlyLogf := func(format string, a ...any) {
@@ -640,10 +658,16 @@ func (opts Options) init(disableLogging bool) (*logtail.Config, *Policy) {
 
 		logHost := logtail.DefaultHost
 		if val := getLogTarget(); val != "" {
-			opts.Logf("You have enabled a non-default log target. Doing without being told to by Tailscale staff or your network administrator will make getting support difficult.")
-			conf.BaseURL = val
-			u, _ := url.Parse(val)
-			logHost = u.Host
+			u, err := url.Parse(val)
+			if err != nil {
+				opts.Logf("logpolicy: invalid TS_LOG_TARGET %q: %v; using default log host", val, err)
+			} else if u.Host == "" {
+				opts.Logf("logpolicy: invalid TS_LOG_TARGET %q: missing host; using default log host", val)
+			} else {
+				opts.Logf("You have enabled a non-default log target. Doing without being told to by Tailscale staff or your network administrator will make getting support difficult.")
+				conf.BaseURL = val
+				logHost = u.Host
+			}
 		}
 
 		if conf.HTTPC == nil {
@@ -872,7 +896,7 @@ func (opts TransportOptions) New() http.RoundTripper {
 		opts.NetMon = netmon.NewStatic()
 	}
 	// Start with a copy of http.DefaultTransport and tweak it a bit.
-	tr := http.DefaultTransport.(*http.Transport).Clone()
+	tr := netutil.NewDefaultTransport()
 	if opts.TLSClientConfig != nil {
 		tr.TLSClientConfig = opts.TLSClientConfig.Clone()
 	}

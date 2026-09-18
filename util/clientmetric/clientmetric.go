@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 //go:build !ts_omit_clientmetrics
@@ -22,6 +22,7 @@ import (
 
 	"tailscale.com/feature/buildfeatures"
 	"tailscale.com/util/set"
+	"tailscale.com/util/testenv"
 )
 
 var (
@@ -57,6 +58,20 @@ const (
 	TypeGauge Type = iota
 	TypeCounter
 )
+
+// MetricUpdate requests that a client metric value be updated.
+//
+// This is the request body sent to /localapi/v0/upload-client-metrics.
+type MetricUpdate struct {
+	Name  string `json:"name"`
+	Type  string `json:"type"`  // one of "counter" or "gauge"
+	Value int    `json:"value"` // amount to increment by or set
+
+	// Op indicates if Value is added to the existing metric value,
+	// or if the metric is set to Value.
+	// One of "add" or "set". If empty, defaults to "add".
+	Op string `json:"op"`
+}
 
 // Metric is an integer metric value that's tracked over time.
 //
@@ -133,15 +148,18 @@ func (m *Metric) Publish() {
 	metrics[m.name] = m
 	sortedDirty = true
 
+	if m.f == nil {
+		if len(valFreeList) == 0 {
+			valFreeList = make([]int64, 256)
+		}
+		m.v = &valFreeList[0]
+		valFreeList = valFreeList[1:]
+	}
+
 	if buildfeatures.HasLogTail {
 		if m.f != nil {
 			lastLogVal = append(lastLogVal, scanEntry{f: m.f})
 		} else {
-			if len(valFreeList) == 0 {
-				valFreeList = make([]int64, 256)
-			}
-			m.v = &valFreeList[0]
-			valFreeList = valFreeList[1:]
 			lastLogVal = append(lastLogVal, scanEntry{v: m.v})
 		}
 	}
@@ -433,6 +451,24 @@ func (b *deltaEncBuf) writeHexVarint(v int64) {
 	hexBuf := b.buf.Bytes()[oldLen : oldLen+hexLen]
 	hex.Encode(hexBuf, b.scratch[:n])
 	b.buf.Write(hexBuf)
+}
+
+// ResetForTest resets all client metric values to zero.
+// It panics if not in a test or if called from a parallel test.
+func ResetForTest(t testenv.TB) {
+	if !testenv.InTest() {
+		panic("clientmetric.ResetForTest called outside a test")
+	}
+	if testenv.InParallelTest(t) {
+		panic("clientmetric.ResetForTest called from a parallel test")
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	for _, m := range metrics {
+		if m.v != nil {
+			atomic.StoreInt64(m.v, 0)
+		}
+	}
 }
 
 var TestHooks testHooks

@@ -3,22 +3,11 @@
 name: CI
 
 env:
-  # Our fuzz job, powered by OSS-Fuzz, fails periodically because we upgrade to
-  # new Go versions very eagerly. OSS-Fuzz is a little more conservative, and
-  # ends up being unable to compile our code.
-  #
-  # When this happens, we want to disable the fuzz target until OSS-Fuzz catches
-  # up. However, we also don't want to forget to turn it back on when OSS-Fuzz
-  # can once again build our code.
-  #
-  # This variable toggles the fuzz job between two modes:
-  #  - false: we expect fuzzing to be happy, and should report failure if it's not.
-  #  - true: we expect fuzzing is broken, and should report failure if it start working.
-  TS_FUZZ_CURRENTLY_BROKEN: false
   # GOMODCACHE is the same definition on all OSes. Within the workspace, we use
   # toplevel directories "src" (for the checked out source code), and "gomodcache"
   # and other caches as siblings to follow.
   GOMODCACHE: ${{ github.workspace }}/gomodcache
+  CMD_GO_USE_GIT_HASH: "true"
 
 on:
   push:
@@ -48,7 +37,7 @@ jobs:
       cache-key: ${{ steps.hash.outputs.key }}
     steps:
       - name: Checkout
-        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           path: src
       - name: Compute cache key from go.{mod,sum}
@@ -57,7 +46,7 @@ jobs:
       # See if the cache entry already exists to avoid downloading it
       # and doing the cache write again.
       - id: check-cache
-        uses: actions/cache/restore@0400d5f644dc74513175e3cd8d07132dd4860809 # v4
+        uses: actions/cache/restore@668228422ae6a00e4ad889ee87cd7109ec5666a7 # v5.0.4
         with:
           path: gomodcache # relative to workspace; see env note at top of file
           key: ${{ steps.hash.outputs.key }}
@@ -69,7 +58,7 @@ jobs:
         run: go mod download
       - name: Cache Go modules
         if: steps.check-cache.outputs.cache-hit != 'true'
-        uses: actions/cache@0400d5f644dc74513175e3cd8d07132dd4860809 # v4.2.4
+        uses: actions/cache@668228422ae6a00e4ad889ee87cd7109ec5666a7 # zizmor: ignore[cache-poisoning] v5.0.4
         with:
           path: gomodcache # relative to workspace; see env note at top of file
           key: ${{ steps.hash.outputs.key }}
@@ -88,11 +77,11 @@ jobs:
           - shard: '4/4'
     steps:
     - name: checkout
-      uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       with:
         path: src
     - name: Restore Go module cache
-      uses: actions/cache/restore@0400d5f644dc74513175e3cd8d07132dd4860809 # v4.2.4
+      uses: actions/cache/restore@668228422ae6a00e4ad889ee87cd7109ec5666a7 # v5.0.4
       with:
         path: gomodcache
         key: ${{ needs.gomod-cache.outputs.cache-key }}
@@ -126,31 +115,30 @@ jobs:
     needs: gomod-cache
     steps:
     - name: checkout
-      uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       with:
         path: src
     - name: Restore Go module cache
-      uses: actions/cache/restore@0400d5f644dc74513175e3cd8d07132dd4860809 # v4.2.4
+      uses: actions/cache/restore@668228422ae6a00e4ad889ee87cd7109ec5666a7 # v5.0.4
       with:
         path: gomodcache
         key: ${{ needs.gomod-cache.outputs.cache-key }}
         enableCrossOsArchive: true
     - name: Restore Cache
-      uses: actions/cache@0400d5f644dc74513175e3cd8d07132dd4860809 # v4.2.4
+      id: restore-cache
+      uses: actions/cache/restore@668228422ae6a00e4ad889ee87cd7109ec5666a7 # v5.0.4
       with:
-        # Note: unlike the other setups, this is only grabbing the mod download
-        # cache, rather than the whole mod directory, as the download cache
-        # contains zips that can be unpacked in parallel faster than they can be
-        # fetched and extracted by tar
+        # Note: this is only restoring the build cache. Mod cache is shared amongst
+        # all jobs in the workflow.
         path: |
           ~/.cache/go-build
           ~\AppData\Local\go-build
-        # The -2- here should be incremented when the scheme of data to be
-        # cached changes (e.g. path above changes).
-        key: ${{ github.job }}-${{ runner.os }}-${{ matrix.goarch }}-${{ matrix.buildflags }}-go-2-${{ hashFiles('**/go.sum') }}-${{ github.run_id }}
+        key: ${{ runner.os }}-${{ matrix.goarch }}-${{ matrix.buildflags }}-go-${{ matrix.shard }}-${{ hashFiles('**/go.sum') }}-${{ github.job }}-${{ github.run_id }}
         restore-keys: |
-          ${{ github.job }}-${{ runner.os }}-${{ matrix.goarch }}-${{ matrix.buildflags }}-go-2-${{ hashFiles('**/go.sum') }}
-          ${{ github.job }}-${{ runner.os }}-${{ matrix.goarch }}-${{ matrix.buildflags }}-go-2-
+          ${{ runner.os }}-${{ matrix.goarch }}-${{ matrix.buildflags }}-go-${{ matrix.shard }}-${{ hashFiles('**/go.sum') }}-${{ github.job }}-
+          ${{ runner.os }}-${{ matrix.goarch }}-${{ matrix.buildflags }}-go-${{ matrix.shard }}-${{ hashFiles('**/go.sum') }}-
+          ${{ runner.os }}-${{ matrix.goarch }}-${{ matrix.buildflags }}-go-${{ matrix.shard }}-
+          ${{ runner.os }}-${{ matrix.goarch }}-${{ matrix.buildflags }}-go-
     - name: build all
       if: matrix.buildflags == '' # skip on race builder
       working-directory: src
@@ -183,7 +171,7 @@ jobs:
         TS_TEST_SHARD: ${{ matrix.shard }}
     - name: bench all
       working-directory: src
-      run: ./tool/go test ${{matrix.buildflags}} -bench=. -benchtime=1x -run=^$ $(for x in $(git grep -l "^func Benchmark" | xargs dirname | sort | uniq); do echo "./$x"; done)
+      run: ./tool/go test ${{matrix.buildflags}} -bench=. -benchtime=1x -run='^$' $(for x in $(git grep -l '^func Benchmark' | xargs dirname | sort | uniq); do echo "./$x"; done)
       env:
         GOARCH: ${{ matrix.goarch }}
     - name: check that no tracked files changed
@@ -206,12 +194,26 @@ jobs:
       shell: bash
       run: |
         find $(go env GOCACHE) -type f -mmin +90 -delete
+    - name: Save Cache
+      # Save cache even on failure, but only on cache miss and main branch to avoid thrashing.
+      if: always() && steps.restore-cache.outputs.cache-hit != 'true' && github.ref == 'refs/heads/main'
+      uses: actions/cache/save@668228422ae6a00e4ad889ee87cd7109ec5666a7 # v5.0.4
+      with:
+        # Note: this is only saving the build cache. Mod cache is shared amongst
+        # all jobs in the workflow.
+        path: |
+          ~/.cache/go-build
+          ~\AppData\Local\go-build
+        key: ${{ runner.os }}-${{ matrix.goarch }}-${{ matrix.buildflags }}-go-${{ matrix.shard }}-${{ hashFiles('**/go.sum') }}-${{ github.job }}-${{ github.run_id }}
 
   windows:
-    # windows-8vpu is a 2022 GitHub-managed runner in our
-    # org with 8 cores and 32 GB of RAM:
-    # https://github.com/organizations/tailscale/settings/actions/github-hosted-runners/1
-    runs-on: windows-8vcpu
+    permissions:
+      id-token: write # This is required for requesting the GitHub action identity JWT that can auth to cigocached
+      contents: read # This is required for actions/checkout
+    # ci-windows-github-1 is a 2022 GitHub-managed runner in our org with 8 cores
+    # and 32 GB of RAM. It is connected to a private Azure VNet that hosts cigocached.
+    # https://github.com/organizations/tailscale/settings/actions/github-hosted-runners/5
+    runs-on: ci-windows-github-1
     needs: gomod-cache
     name: Windows (${{ matrix.name || matrix.shard}})
     strategy:
@@ -220,85 +222,138 @@ jobs:
         include:
           - key: "win-bench"
             name: "benchmarks"
-          - key: "win-tool-go"
-            name: "./tool/go"
           - key: "win-shard-1-2"
             shard: "1/2"
           - key: "win-shard-2-2"
             shard: "2/2"
     steps:
     - name: checkout
-      uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       with:
-        path: src
-
-    - name: Install Go
-      if: matrix.key != 'win-tool-go'
-      uses: actions/setup-go@d35c59abb061a4a6fb18e82ac0862c26744d6ab5 # v5.5.0
-      with:
-        go-version-file: src/go.mod
-        cache: false
+        path: ${{ github.workspace }}/src
 
     - name: Restore Go module cache
-      if: matrix.key != 'win-tool-go'
-      uses: actions/cache/restore@0400d5f644dc74513175e3cd8d07132dd4860809 # v4.2.4
+      uses: actions/cache/restore@668228422ae6a00e4ad889ee87cd7109ec5666a7 # v5.0.4
       with:
         path: gomodcache
         key: ${{ needs.gomod-cache.outputs.cache-key }}
         enableCrossOsArchive: true
 
-    - name: Restore Cache
-      if: matrix.key != 'win-tool-go'
-      uses: actions/cache@0400d5f644dc74513175e3cd8d07132dd4860809 # v4.2.4
+    - name: Set up cigocacher
+      id: cigocacher-setup
+      uses: ./src/.github/actions/go-cache
       with:
-        path: |
-          ~/.cache/go-build
-          ~\AppData\Local\go-build
-        # The -2- here should be incremented when the scheme of data to be
-        # cached changes (e.g. path above changes).
-        key: ${{ github.job }}-${{ matrix.key }}-go-2-${{ hashFiles('**/go.sum') }}-${{ github.run_id }}
-        restore-keys: |
-          ${{ github.job }}-${{ matrix.key }}-go-2-${{ hashFiles('**/go.sum') }}
-          ${{ github.job }}-${{ matrix.key }}-go-2-
-
-    - name: test-tool-go
-      if: matrix.key == 'win-tool-go'
-      working-directory: src
-      run: ./tool/go version
+        checkout-path: ${{ github.workspace }}/src
+        cache-dir: ${{ github.workspace }}/cigocacher
+        cigocached-url: ${{ vars.CIGOCACHED_AZURE_URL }}
+        cigocached-host: ${{ vars.CIGOCACHED_AZURE_HOST }}
 
     - name: test
-      if: matrix.key != 'win-bench' && matrix.key != 'win-tool-go' # skip on bench builder
+      shell: bash
+      if: matrix.key != 'win-bench' # skip on bench builder
       working-directory: src
-      run: go run ./cmd/testwrapper sharded:${{ matrix.shard }}
+      # -count=1: a cached pass is never retried, so flakes can't be reported.
+      run: ./tool/go run ./cmd/testwrapper sharded:${{ matrix.shard }} -count=1
+      env:
+        NOPWSHDEBUG: "true" # to quiet tool/gocross/gocross-wrapper.ps1 in CI
+        TS_TESTWRAPPER_RESULTS_SUMMARY: "1"
+        TS_TESTWRAPPER_RESULTS_PKG: tailscale.com/tstest/integration
+        TS_TESTWRAPPER_RESULTS_JSON: ${{ github.workspace }}/windows-integration-results.json
+
+    - name: Upload Windows integration results
+      if: always() && matrix.key != 'win-bench'
+      uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
+      with:
+        name: windows-integration-results-${{ matrix.key }}
+        path: ${{ github.workspace }}/windows-integration-results.json
+        if-no-files-found: ignore
 
     - name: bench all
+      shell: bash
       if: matrix.key == 'win-bench'
       working-directory: src
-      # Don't use -bench=. -benchtime=1x.
-      # Somewhere in the layers (powershell?)
-      # the equals signs cause great confusion.
-      run: go test ./... -bench . -benchtime 1x -run "^$"
+      run: ./tool/go test -bench=. -benchtime=1x -run='^$' $(for x in $(git grep -l '^func Benchmark' | xargs dirname | sort | uniq); do echo "./$x"; done)
+      env:
+        NOPWSHDEBUG: "true" # to quiet tool/gocross/gocross-wrapper.ps1 in CI
 
-    - name: Tidy cache
-      if: matrix.key != 'win-tool-go'
-      working-directory: src
-      shell: bash
+    - name: Print stats
+      shell: pwsh
+      if: steps.cigocacher-setup.outputs.success == 'true'
+      env:
+        GOCACHEPROG: ${{ env.GOCACHEPROG }}
       run: |
-        find $(go env GOCACHE) -type f -mmin +90 -delete
+        Invoke-Expression "$env:GOCACHEPROG --stats" | jq .
+
+  macos:
+    runs-on: macos-latest
+    needs: gomod-cache
+    steps:
+    - name: checkout
+      uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      with:
+        path: src
+    - name: Restore Go module cache
+      uses: actions/cache/restore@668228422ae6a00e4ad889ee87cd7109ec5666a7 # v5.0.4
+      with:
+        path: gomodcache
+        key: ${{ needs.gomod-cache.outputs.cache-key }}
+        enableCrossOsArchive: true
+    - name: Restore Cache
+      id: restore-cache
+      uses: actions/cache/restore@668228422ae6a00e4ad889ee87cd7109ec5666a7 # v5.0.4
+      with:
+        path: ~/Library/Caches/go-build
+        key: ${{ runner.os }}-go-test-${{ hashFiles('**/go.sum') }}-${{ github.job }}-${{ github.run_id }}
+        restore-keys: |
+          ${{ runner.os }}-go-test-${{ hashFiles('**/go.sum') }}-${{ github.job }}-
+          ${{ runner.os }}-go-test-${{ hashFiles('**/go.sum') }}-
+          ${{ runner.os }}-go-test-
+    - name: build test wrapper
+      working-directory: src
+      run: ./tool/go build -o /tmp/testwrapper ./cmd/testwrapper
+    - name: test all
+      working-directory: src
+      run: PATH=$PWD/tool:$PATH /tmp/testwrapper ./...
+    - name: check that no tracked files changed
+      working-directory: src
+      run: git diff --no-ext-diff --name-only --exit-code || (echo "Build/test modified the files above."; exit 1)
+    - name: check that no new files were added
+      working-directory: src
+      run: |
+        # Note: The "error: pathspec..." you see below is normal!
+        # In the success case in which there are no new untracked files,
+        # git ls-files complains about the pathspec not matching anything.
+        # That's OK. It's not worth the effort to suppress. Please ignore it.
+        if git ls-files --others --exclude-standard --directory --no-empty-directory --error-unmatch -- ':/*'
+        then
+          echo "Build/test created untracked files in the repo (file names above)."
+          exit 1
+        fi
+    - name: Tidy cache
+      working-directory: src
+      run: |
+        find $(./tool/go env GOCACHE) -type f -mmin +90 -delete
+    - name: Save Cache
+      # Save cache even on failure, but only on cache miss and main branch to avoid thrashing.
+      if: always() && steps.restore-cache.outputs.cache-hit != 'true' && github.ref == 'refs/heads/main'
+      uses: actions/cache/save@668228422ae6a00e4ad889ee87cd7109ec5666a7 # v5.0.4
+      with:
+        path: ~/Library/Caches/go-build
+        key: ${{ runner.os }}-go-test-${{ hashFiles('**/go.sum') }}-${{ github.job }}-${{ github.run_id }}
 
   privileged:
     needs: gomod-cache
     runs-on: ubuntu-24.04
     container:
-      image: golang:latest
+      image: golang:latest # zizmor: ignore[unpinned-images]
       options: --privileged
     steps:
     - name: checkout
-      uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       with:
         path: src
     - name: Restore Go module cache
-      uses: actions/cache/restore@0400d5f644dc74513175e3cd8d07132dd4860809 # v4.2.4
+      uses: actions/cache/restore@668228422ae6a00e4ad889ee87cd7109ec5666a7 # v5.0.4
       with:
         path: gomodcache
         key: ${{ needs.gomod-cache.outputs.cache-key }}
@@ -308,31 +363,7 @@ jobs:
       run: chown -R $(id -u):$(id -g) $PWD
     - name: privileged tests
       working-directory: src
-      run: ./tool/go test ./util/linuxfw ./derp/xdp
-
-  vm:
-    needs: gomod-cache
-    runs-on: ["self-hosted", "linux", "vm"]
-    # VM tests run with some privileges, don't let them run on 3p PRs.
-    if: github.repository == 'tailscale/tailscale'
-    steps:
-    - name: checkout
-      uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
-      with:
-        path: src
-    - name: Restore Go module cache
-      uses: actions/cache/restore@0400d5f644dc74513175e3cd8d07132dd4860809 # v4.2.4
-      with:
-        path: gomodcache
-        key: ${{ needs.gomod-cache.outputs.cache-key }}
-        enableCrossOsArchive: true
-    - name: Run VM tests
-      working-directory: src
-      run: ./tool/go test ./tstest/integration/vms -v -no-s3 -run-vm-tests -run=TestRunUbuntu2404
-      env:
-        HOME: "/var/lib/ghrunner/home"
-        TMPDIR: "/tmp"
-        XDG_CACHE_HOME: "/var/lib/ghrunner/cache"
+      run: ./tool/go test $(./tool/go run ./tool/listpkgs --has-root-tests)
 
   cross: # cross-compile checks, build only.
     needs: gomod-cache
@@ -373,31 +404,29 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
     - name: checkout
-      uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       with:
         path: src
-    - name: Restore Cache
-      uses: actions/cache@0400d5f644dc74513175e3cd8d07132dd4860809 # v4.2.4
-      with:
-        # Note: unlike the other setups, this is only grabbing the mod download
-        # cache, rather than the whole mod directory, as the download cache
-        # contains zips that can be unpacked in parallel faster than they can be
-        # fetched and extracted by tar
-        path: |
-          ~/.cache/go-build
-          ~\AppData\Local\go-build
-        # The -2- here should be incremented when the scheme of data to be
-        # cached changes (e.g. path above changes).
-        key: ${{ github.job }}-${{ runner.os }}-${{ matrix.goos }}-${{ matrix.goarch }}-go-2-${{ hashFiles('**/go.sum') }}-${{ github.run_id }}
-        restore-keys: |
-          ${{ github.job }}-${{ runner.os }}-${{ matrix.goos }}-${{ matrix.goarch }}-go-2-${{ hashFiles('**/go.sum') }}
-          ${{ github.job }}-${{ runner.os }}-${{ matrix.goos }}-${{ matrix.goarch }}-go-2-
     - name: Restore Go module cache
-      uses: actions/cache/restore@0400d5f644dc74513175e3cd8d07132dd4860809 # v4.2.4
+      uses: actions/cache/restore@668228422ae6a00e4ad889ee87cd7109ec5666a7 # v5.0.4
       with:
         path: gomodcache
         key: ${{ needs.gomod-cache.outputs.cache-key }}
         enableCrossOsArchive: true
+    - name: Restore Cache
+      id: restore-cache
+      uses: actions/cache/restore@668228422ae6a00e4ad889ee87cd7109ec5666a7 # v5.0.4
+      with:
+        # Note: this is only restoring the build cache. Mod cache is shared amongst
+        # all jobs in the workflow.
+        path: |
+          ~/.cache/go-build
+          ~\AppData\Local\go-build
+        key: ${{ runner.os }}-${{ matrix.goos }}-${{ matrix.goarch }}-${{ matrix.goarm }}-go-${{ hashFiles('**/go.sum') }}-${{ github.job }}-${{ github.run_id }}
+        restore-keys: |
+          ${{ runner.os }}-${{ matrix.goos }}-${{ matrix.goarch }}-${{ matrix.goarm }}-go-${{ hashFiles('**/go.sum') }}-${{ github.job }}-
+          ${{ runner.os }}-${{ matrix.goos }}-${{ matrix.goarch }}-${{ matrix.goarm }}-go-${{ hashFiles('**/go.sum') }}-
+          ${{ runner.os }}-${{ matrix.goos }}-${{ matrix.goarch }}-${{ matrix.goarm }}-go-
     - name: build all
       working-directory: src
       run: ./tool/go build ./cmd/...
@@ -418,6 +447,17 @@ jobs:
       shell: bash
       run: |
         find $(go env GOCACHE) -type f -mmin +90 -delete
+    - name: Save Cache
+      # Save cache even on failure, but only on cache miss and main branch to avoid thrashing.
+      if: always() && steps.restore-cache.outputs.cache-hit != 'true' && github.ref == 'refs/heads/main'
+      uses: actions/cache/save@668228422ae6a00e4ad889ee87cd7109ec5666a7 # v5.0.4
+      with:
+        # Note: this is only saving the build cache. Mod cache is shared amongst
+        # all jobs in the workflow.
+        path: |
+          ~/.cache/go-build
+          ~\AppData\Local\go-build
+        key: ${{ runner.os }}-${{ matrix.goos }}-${{ matrix.goarch }}-${{ matrix.goarm }}-go-${{ hashFiles('**/go.sum') }}-${{ github.job }}-${{ github.run_id }}
 
   ios: # similar to cross above, but iOS can't build most of the repo. So, just
        # make it build a few smoke packages.
@@ -425,11 +465,11 @@ jobs:
     needs: gomod-cache
     steps:
     - name: checkout
-      uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       with:
         path: src
     - name: Restore Go module cache
-      uses: actions/cache/restore@0400d5f644dc74513175e3cd8d07132dd4860809 # v4.2.4
+      uses: actions/cache/restore@668228422ae6a00e4ad889ee87cd7109ec5666a7 # v5.0.4
       with:
         path: gomodcache
         key: ${{ needs.gomod-cache.outputs.cache-key }}
@@ -463,31 +503,29 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
     - name: checkout
-      uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       with:
         path: src
-    - name: Restore Cache
-      uses: actions/cache@0400d5f644dc74513175e3cd8d07132dd4860809 # v4.2.4
-      with:
-        # Note: unlike the other setups, this is only grabbing the mod download
-        # cache, rather than the whole mod directory, as the download cache
-        # contains zips that can be unpacked in parallel faster than they can be
-        # fetched and extracted by tar
-        path: |
-          ~/.cache/go-build
-          ~\AppData\Local\go-build
-        # The -2- here should be incremented when the scheme of data to be
-        # cached changes (e.g. path above changes).
-        key: ${{ github.job }}-${{ runner.os }}-${{ matrix.goos }}-${{ matrix.goarch }}-go-2-${{ hashFiles('**/go.sum') }}-${{ github.run_id }}
-        restore-keys: |
-          ${{ github.job }}-${{ runner.os }}-${{ matrix.goos }}-${{ matrix.goarch }}-go-2-${{ hashFiles('**/go.sum') }}
-          ${{ github.job }}-${{ runner.os }}-${{ matrix.goos }}-${{ matrix.goarch }}-go-2-
     - name: Restore Go module cache
-      uses: actions/cache/restore@0400d5f644dc74513175e3cd8d07132dd4860809 # v4.2.4
+      uses: actions/cache/restore@668228422ae6a00e4ad889ee87cd7109ec5666a7 # v5.0.4
       with:
         path: gomodcache
         key: ${{ needs.gomod-cache.outputs.cache-key }}
         enableCrossOsArchive: true
+    - name: Restore Cache
+      id: restore-cache
+      uses: actions/cache/restore@668228422ae6a00e4ad889ee87cd7109ec5666a7 # v5.0.4
+      with:
+        # Note: this is only restoring the build cache. Mod cache is shared amongst
+        # all jobs in the workflow.
+        path: |
+          ~/.cache/go-build
+          ~\AppData\Local\go-build
+        key: ${{ runner.os }}-${{ matrix.goos }}-${{ matrix.goarch }}-go-${{ hashFiles('**/go.sum') }}-${{ github.job }}-${{ github.run_id }}
+        restore-keys: |
+          ${{ runner.os }}-${{ matrix.goos }}-${{ matrix.goarch }}-go-${{ hashFiles('**/go.sum') }}-${{ github.job }}-
+          ${{ runner.os }}-${{ matrix.goos }}-${{ matrix.goarch }}-go-${{ hashFiles('**/go.sum') }}-
+          ${{ runner.os }}-${{ matrix.goos }}-${{ matrix.goarch }}-go-
     - name: build core
       working-directory: src
       run: ./tool/go build ./cmd/tailscale ./cmd/tailscaled
@@ -501,6 +539,17 @@ jobs:
       shell: bash
       run: |
         find $(go env GOCACHE) -type f -mmin +90 -delete
+    - name: Save Cache
+      # Save cache even on failure, but only on cache miss and main branch to avoid thrashing.
+      if: always() && steps.restore-cache.outputs.cache-hit != 'true' && github.ref == 'refs/heads/main'
+      uses: actions/cache/save@668228422ae6a00e4ad889ee87cd7109ec5666a7 # v5.0.4
+      with:
+        # Note: this is only saving the build cache. Mod cache is shared amongst
+        # all jobs in the workflow.
+        path: |
+          ~/.cache/go-build
+          ~\AppData\Local\go-build
+        key: ${{ runner.os }}-${{ matrix.goos }}-${{ matrix.goarch }}-go-${{ hashFiles('**/go.sum') }}-${{ github.job }}-${{ github.run_id }}
 
   android:
     # similar to cross above, but android fails to build a few pieces of the
@@ -510,7 +559,7 @@ jobs:
     needs: gomod-cache
     steps:
     - name: checkout
-      uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       with:
         path: src
       # Super minimal Android build that doesn't even use CGO and doesn't build everything that's needed
@@ -518,7 +567,7 @@ jobs:
       # some Android breakages early.
       # TODO(bradfitz): better; see https://github.com/tailscale/tailscale/issues/4482
     - name: Restore Go module cache
-      uses: actions/cache/restore@0400d5f644dc74513175e3cd8d07132dd4860809 # v4.2.4
+      uses: actions/cache/restore@668228422ae6a00e4ad889ee87cd7109ec5666a7 # v5.0.4
       with:
         path: gomodcache
         key: ${{ needs.gomod-cache.outputs.cache-key }}
@@ -535,31 +584,29 @@ jobs:
     needs: gomod-cache
     steps:
     - name: checkout
-      uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       with:
         path: src
-    - name: Restore Cache
-      uses: actions/cache@0400d5f644dc74513175e3cd8d07132dd4860809 # v4.2.4
-      with:
-        # Note: unlike the other setups, this is only grabbing the mod download
-        # cache, rather than the whole mod directory, as the download cache
-        # contains zips that can be unpacked in parallel faster than they can be
-        # fetched and extracted by tar
-        path: |
-          ~/.cache/go-build
-          ~\AppData\Local\go-build
-        # The -2- here should be incremented when the scheme of data to be
-        # cached changes (e.g. path above changes).
-        key: ${{ github.job }}-${{ runner.os }}-go-2-${{ hashFiles('**/go.sum') }}-${{ github.run_id }}
-        restore-keys: |
-          ${{ github.job }}-${{ runner.os }}-go-2-${{ hashFiles('**/go.sum') }}
-          ${{ github.job }}-${{ runner.os }}-go-2-
     - name: Restore Go module cache
-      uses: actions/cache/restore@0400d5f644dc74513175e3cd8d07132dd4860809 # v4.2.4
+      uses: actions/cache/restore@668228422ae6a00e4ad889ee87cd7109ec5666a7 # v5.0.4
       with:
         path: gomodcache
         key: ${{ needs.gomod-cache.outputs.cache-key }}
         enableCrossOsArchive: true
+    - name: Restore Cache
+      id: restore-cache
+      uses: actions/cache/restore@668228422ae6a00e4ad889ee87cd7109ec5666a7 # v5.0.4
+      with:
+        # Note: this is only restoring the build cache. Mod cache is shared amongst
+        # all jobs in the workflow.
+        path: |
+          ~/.cache/go-build
+          ~\AppData\Local\go-build
+        key: ${{ runner.os }}-js-wasm-go-${{ hashFiles('**/go.sum') }}-${{ github.job }}-${{ github.run_id }}
+        restore-keys: |
+          ${{ runner.os }}-js-wasm-go-${{ hashFiles('**/go.sum') }}-${{ github.job }}-
+          ${{ runner.os }}-js-wasm-go-${{ hashFiles('**/go.sum') }}-
+          ${{ runner.os }}-js-wasm-go-
     - name: build tsconnect client
       working-directory: src
       run: ./tool/go build ./cmd/tsconnect/wasm ./cmd/tailscale/cli
@@ -573,22 +620,40 @@ jobs:
       run: |
         ./tool/go run ./cmd/tsconnect --fast-compression build
         ./tool/go run ./cmd/tsconnect --fast-compression build-pkg
+    - name: verify Google Chrome is available
+      run: |
+        which google-chrome
+        google-chrome --version
+    - name: tsconnect js/wasm headless-browser tests
+      working-directory: src
+      run: ./tool/go test ./tstest/integration/jswasmtest/ -v -timeout 180s --run-headless-browser-tests
     - name: Tidy cache
       working-directory: src
       shell: bash
       run: |
         find $(go env GOCACHE) -type f -mmin +90 -delete
+    - name: Save Cache
+      # Save cache even on failure, but only on cache miss and main branch to avoid thrashing.
+      if: always() && steps.restore-cache.outputs.cache-hit != 'true' && github.ref == 'refs/heads/main'
+      uses: actions/cache/save@668228422ae6a00e4ad889ee87cd7109ec5666a7 # v5.0.4
+      with:
+        # Note: this is only saving the build cache. Mod cache is shared amongst
+        # all jobs in the workflow.
+        path: |
+          ~/.cache/go-build
+          ~\AppData\Local\go-build
+        key: ${{ runner.os }}-js-wasm-go-${{ hashFiles('**/go.sum') }}-${{ github.job }}-${{ github.run_id }}
 
   tailscale_go: # Subset of tests that depend on our custom Go toolchain.
     runs-on: ubuntu-24.04
     needs: gomod-cache
     steps:
     - name: checkout
-      uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
     - name: Set GOMODCACHE env
       run: echo "GOMODCACHE=$HOME/.cache/go-mod" >> $GITHUB_ENV
     - name: Restore Go module cache
-      uses: actions/cache/restore@0400d5f644dc74513175e3cd8d07132dd4860809 # v4.2.4
+      uses: actions/cache/restore@668228422ae6a00e4ad889ee87cd7109ec5666a7 # v5.0.4
       with:
         path: gomodcache
         key: ${{ needs.gomod-cache.outputs.cache-key }}
@@ -596,86 +661,18 @@ jobs:
     - name: test tailscale_go
       run: ./tool/go test -tags=tailscale_go,ts_enable_sockstats ./net/sockstats/...
 
-
-  fuzz:
-    # This target periodically breaks (see TS_FUZZ_CURRENTLY_BROKEN at the top
-    # of the file), so it's more complex than usual: the 'build fuzzers' step
-    # might fail, and depending on the value of 'TS_FUZZ_CURRENTLY_BROKEN', that
-    # might or might not be fine. The steps after the build figure out whether
-    # the success/failure is expected, and appropriately pass/fail the job
-    # overall accordingly.
-    #
-    # Practically, this means that all steps after 'build fuzzers' must have an
-    # explicit 'if' condition, because the default condition for steps is
-    # 'success()', meaning "only run this if no previous steps failed".
-    if: github.event_name == 'pull_request'
-    runs-on: ubuntu-24.04
-    steps:
-    - name: build fuzzers
-      id: build
-      # As of 21 October 2025, this repo doesn't tag releases, so this commit
-      # hash is just the tip of master.
-      uses: google/oss-fuzz/infra/cifuzz/actions/build_fuzzers@1242ccb5b6352601e73c00f189ac2ae397242264
-      # continue-on-error makes steps.build.conclusion be 'success' even if
-      # steps.build.outcome is 'failure'. This means this step does not
-      # contribute to the job's overall pass/fail evaluation.
-      continue-on-error: true
-      with:
-       oss-fuzz-project-name: 'tailscale'
-       dry-run: false
-       language: go
-    - name: report unexpectedly broken fuzz build
-      if: steps.build.outcome == 'failure' && env.TS_FUZZ_CURRENTLY_BROKEN != 'true'
-      run: |
-        echo "fuzzer build failed, see above for why"
-        echo "if the failure is due to OSS-Fuzz not being on the latest Go yet,"
-        echo "set TS_FUZZ_CURRENTLY_BROKEN=true in .github/workflows/test.yml"
-        echo "to temporarily disable fuzzing until OSS-Fuzz works again."
-        exit 1
-    - name: report unexpectedly working fuzz build
-      if: steps.build.outcome == 'success' && env.TS_FUZZ_CURRENTLY_BROKEN == 'true'
-      run: |
-        echo "fuzzer build succeeded, but we expect it to be broken"
-        echo "please set TS_FUZZ_CURRENTLY_BROKEN=false in .github/workflows/test.yml"
-        echo "to reenable fuzz testing"
-        exit 1
-    - name: run fuzzers
-      id: run
-      # Run the fuzzers whenever they're able to build, even if we're going to
-      # report a failure because TS_FUZZ_CURRENTLY_BROKEN is set to the wrong
-      # value.
-      if: steps.build.outcome == 'success'
-      # As of 21 October 2025, this repo doesn't tag releases, so this commit
-      # hash is just the tip of master.
-      uses: google/oss-fuzz/infra/cifuzz/actions/run_fuzzers@1242ccb5b6352601e73c00f189ac2ae397242264
-      with:
-        oss-fuzz-project-name: 'tailscale'
-        fuzz-seconds: 150
-        dry-run: false
-        language: go
-    - name: Set artifacts_path in env (workaround for actions/upload-artifact#176)
-      if: steps.run.outcome != 'success' && steps.build.outcome == 'success'
-      run: |
-        echo "artifacts_path=$(realpath .)" >> $GITHUB_ENV
-    - name: upload crash
-      uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
-      if: steps.run.outcome != 'success' && steps.build.outcome == 'success'
-      with:
-        name: artifacts
-        path: ${{ env.artifacts_path }}/out/artifacts
-
   depaware:
     runs-on: ubuntu-24.04
     needs: gomod-cache
     steps:
     - name: checkout
-      uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       with:
         path: src
     - name: Set GOMODCACHE env
       run: echo "GOMODCACHE=$HOME/.cache/go-mod" >> $GITHUB_ENV
     - name: Restore Go module cache
-      uses: actions/cache/restore@0400d5f644dc74513175e3cd8d07132dd4860809 # v4.2.4
+      uses: actions/cache/restore@668228422ae6a00e4ad889ee87cd7109ec5666a7 # v5.0.4
       with:
         path: gomodcache
         key: ${{ needs.gomod-cache.outputs.cache-key }}
@@ -689,11 +686,11 @@ jobs:
     needs: gomod-cache
     steps:
     - name: checkout
-      uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       with:
         path: src
     - name: Restore Go module cache
-      uses: actions/cache/restore@0400d5f644dc74513175e3cd8d07132dd4860809 # v4.2.4
+      uses: actions/cache/restore@668228422ae6a00e4ad889ee87cd7109ec5666a7 # v5.0.4
       with:
         path: gomodcache
         key: ${{ needs.gomod-cache.outputs.cache-key }}
@@ -703,25 +700,34 @@ jobs:
       run: |
         pkgs=$(./tool/go list ./... | grep -Ev 'dnsfallback|k8s-operator|xdp')
         ./tool/go generate $pkgs
+        git add -N . # ensure untracked files are noticed
         echo
         echo
         git diff --name-only --exit-code || (echo "The files above need updating. Please run 'go generate'."; exit 1)
+    - name: check that 'genreadme' is clean
+      working-directory: src
+      run: |
+        ./tool/go run ./misc/genreadme
+        git add -N . # ensure untracked files are noticed
+        echo
+        echo
+        git diff --name-only --exit-code || (echo "The files above need updating. Please run './tool/go run ./misc/genreadme'."; exit 1)
 
-  go_mod_tidy:
+  make_tidy:
     runs-on: ubuntu-24.04
     needs: gomod-cache
     steps:
     - name: checkout
-      uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       with:
         path: src
     - name: Restore Go module cache
-      uses: actions/cache/restore@0400d5f644dc74513175e3cd8d07132dd4860809 # v4.2.4
+      uses: actions/cache/restore@668228422ae6a00e4ad889ee87cd7109ec5666a7 # v5.0.4
       with:
         path: gomodcache
         key: ${{ needs.gomod-cache.outputs.cache-key }}
         enableCrossOsArchive: true
-    - name: check that 'go mod tidy' is clean
+    - name: check that 'make tidy' is clean
       working-directory: src
       run: |
         make tidy
@@ -734,11 +740,11 @@ jobs:
     needs: gomod-cache
     steps:
     - name: checkout
-      uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       with:
         path: src
     - name: Restore Go module cache
-      uses: actions/cache/restore@0400d5f644dc74513175e3cd8d07132dd4860809 # v4.2.4
+      uses: actions/cache/restore@668228422ae6a00e4ad889ee87cd7109ec5666a7 # v5.0.4
       with:
         path: gomodcache
         key: ${{ needs.gomod-cache.outputs.cache-key }}
@@ -788,11 +794,11 @@ jobs:
 
     steps:
     - name: checkout
-      uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       with:
         path: src
     - name: Restore Go module cache
-      uses: actions/cache/restore@0400d5f644dc74513175e3cd8d07132dd4860809 # v4.2.4
+      uses: actions/cache/restore@668228422ae6a00e4ad889ee87cd7109ec5666a7 # v5.0.4
       with:
         path: gomodcache
         key: ${{ needs.gomod-cache.outputs.cache-key }}
@@ -809,19 +815,18 @@ jobs:
   notify_slack:
     if: always()
     # Any of these jobs failing causes a slack notification.
-    needs: 
+    needs:
       - android
       - test
       - windows
-      - vm
+      - macos
       - cross
       - ios
       - wasm
       - tailscale_go
-      - fuzz
       - depaware
       - go_generate
-      - go_mod_tidy
+      - make_tidy
       - licenses
       - staticcheck
     runs-on: ubuntu-24.04
@@ -851,6 +856,116 @@ jobs:
             }]
           }
 
+  notify_windows:
+    if: always()
+    needs:
+      - windows
+    runs-on: ubuntu-24.04
+    steps:
+    - name: Download Windows integration results
+      uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+      with:
+        pattern: windows-integration-results-*
+        path: results
+    - name: Build Slack payload
+      id: payload
+      env:
+        WINDOWS_RESULT: ${{ needs.windows.result }}
+        PR_TITLE: ${{ github.event.pull_request.title }}
+        PR_NUMBER: ${{ github.event.pull_request.number }}
+        PR_URL: ${{ github.event.pull_request.html_url }}
+        # head.ref is untrusted on fork PRs; keep it in env and encode via jq --arg, never run: text.
+        HEAD_REF: ${{ github.event.pull_request.head.ref }}
+        RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        # Non-bench legs of the windows matrix; a missing artifact means a shard never reported.
+        EXPECTED_SHARDS: "2"
+      run: |
+        # Read each artifact separately so one unreadable file can't discard the others.
+        rows='[]'; unreadable=0; reported=0
+        while IFS= read -r -d '' f; do
+          reported=$((reported + 1))
+          [ -s "$f" ] || continue
+          case "$(jq -r 'type' "$f" 2>/dev/null)" in
+            array) rows=$(printf '%s\n%s' "$rows" "$(jq -c . "$f")" | jq -s 'add') ;;
+            null)  ;; # shard ran none of the filtered package
+            *)     unreadable=$((unreadable + 1)) ;;
+          esac
+        done < <(find results -name windows-integration-results.json -print0 2>/dev/null)
+        # Dedupe so a re-shard reporting a test twice can't double every count.
+        rows=$(printf '%s' "$rows" | jq '[ .[] | objects ] | unique_by([.Package, .Test])')
+        count() { printf '%s' "$rows" | jq "[ (. // [])[] | select(.Outcome == \"$1\") ] | length"; }
+        retried=$(count retried)
+        passed=$(( $(count pass) + retried ))
+        failed=$(count fail)
+        skipped=$(count skip)
+        executed=$((passed + failed))
+        if [ "$executed" -gt 0 ]; then pct=$(( (passed * 100) / executed )); else pct=0; fi
+        # Names behind the retried count, capped so one bad run can't flood the message.
+        flaky=$(printf '%s' "$rows" | jq -r '
+          [ .[] | select(.Outcome == "retried") | (.Package | sub("^tailscale\\.com/"; "")) + "." + .Test ]
+          | sort
+          | if length > 5 then (.[:5] | join(", ")) + ", and \(length - 5) more" else join(", ") end')
+
+        case "$WINDOWS_RESULT" in
+          success)   emoji=":white_check_mark:"; color="good" ;;
+          failure)   emoji=":x:";                color="danger" ;;
+          cancelled) emoji=":no_entry_sign:";    color="warning" ;;
+          skipped)   emoji=":fast_forward:";     color="warning" ;;
+          *)         emoji=":question:";         color="warning" ;;
+        esac
+
+        integration="${passed} passed, ${failed} failed, ${skipped} skipped"
+        if [ "$executed" -gt 0 ]; then
+          integration="${integration} (${pct}%)"
+        fi
+        # Anything that makes the numbers incomplete or overstated is said out loud.
+        caveats=""
+        if [ "$unreadable" -gt 0 ]; then
+          caveats="${caveats} — ${unreadable} shard artifact(s) unreadable"
+        fi
+        if [ "$reported" -lt "$EXPECTED_SHARDS" ]; then
+          caveats="${caveats} — only ${reported} of ${EXPECTED_SHARDS} shards reported"
+        fi
+        # Retries get their own line below, so they don't warn the count line.
+        if [ "$executed" -eq 0 ]; then
+          caveats="${caveats} — no tests executed"
+        fi
+        if [ "$WINDOWS_RESULT" = "failure" ] && [ "$failed" -eq 0 ]; then
+          caveats="${caveats} — results may be partial (build error or timeout)"
+        fi
+        integration="${integration}${caveats}"
+        if [ "$failed" -gt 0 ]; then int_emoji=":x:"
+        elif [ -n "$caveats" ]; then int_emoji=":warning:"
+        else int_emoji=":white_check_mark:"; fi
+
+        jq -n --arg emoji "$emoji" --arg status "$WINDOWS_RESULT" --arg int_emoji "$int_emoji" \
+          --arg integration "$integration" --arg flaky "$flaky" --arg retried "$retried" \
+          --arg branch "$HEAD_REF" --arg title "$PR_TITLE" --arg pr_url "$PR_URL" --arg pr_number "$PR_NUMBER" \
+          --arg color "$color" --arg run_url "$RUN_URL" \
+          '{attachments: [{
+            title: ($emoji + " " + $title + ": " + $status),
+            title_link: $run_url,
+            text: (
+              "<" + $pr_url + "|PR #" + $pr_number + "> · `" + $branch + "`"
+              + "\n\n" + $emoji + " Windows CI: " + $status
+              + "\n" + $int_emoji + " Windows Integration Tests: " + $integration
+              + (if $flaky == "" then "" else "\n    ↳ :warning: Flaky Tests (" + $retried + " passed on retry): " + $flaky end)
+              + "\n\n<" + $run_url + "|View run details>"
+            ),
+            color: $color,
+            mrkdwn_in: ["text"]
+          }]}' > payload.json
+    - name: Send Slack notification
+      env:
+        WEBHOOK: ${{ secrets.WINDOWS_SLACK_WEBHOOK_URL }}
+      if: env.WEBHOOK != '' && github.event_name == 'pull_request' && needs.windows.result != 'cancelled'
+      continue-on-error: true
+      uses: slackapi/slack-github-action@91efab103c0de0a537f72a35f6b8cda0ee76bf0a # v2.1.1
+      with:
+        webhook: ${{ env.WEBHOOK }}
+        webhook-type: incoming-webhook
+        payload-file-path: payload.json
+
   merge_blocker:
     if: always()
     runs-on: ubuntu-24.04
@@ -858,15 +973,14 @@ jobs:
       - android
       - test
       - windows
-      - vm
+      - macos
       - cross
       - ios
       - wasm
       - tailscale_go
-      - fuzz
       - depaware
       - go_generate
-      - go_mod_tidy
+      - make_tidy
       - licenses
       - staticcheck
     steps:
@@ -890,7 +1004,7 @@ jobs:
       - tailscale_go
       - depaware
       - go_generate
-      - go_mod_tidy
+      - make_tidy
       - licenses
       - staticcheck
     steps:
@@ -907,9 +1021,8 @@ jobs:
       - check_mergeability_strict
       - test
       - windows
-      - vm
+      - macos
       - wasm
-      - fuzz
       - race-root-integration
       - privileged
     steps:

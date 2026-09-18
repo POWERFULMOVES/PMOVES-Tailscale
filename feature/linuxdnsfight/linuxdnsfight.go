@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 //go:build linux && !android
@@ -12,10 +12,14 @@ import (
 	"fmt"
 
 	"github.com/illarion/gonotify/v3"
+	"tailscale.com/feature"
 	"tailscale.com/net/dns"
 )
 
 func init() {
+	if !feature.Register("linuxdnsfight") {
+		return
+	}
 	dns.HookWatchFile.Set(watchFile)
 }
 

@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 package derp_test
@@ -33,6 +33,165 @@ type (
 	Conn       = derp.Conn
 	Client     = derp.Client
 )
+
+func TestReadFrameHeader(t *testing.T) {
+	tests := []struct {
+		name     string
+		input    [5]byte
+		wantType derp.FrameType
+		wantLen  uint32
+	}{
+		{
+			name:     "SendPacket",
+			input:    [5]byte{byte(derp.FrameSendPacket), 0x00, 0x00, 0x04, 0x00},
+			wantType: derp.FrameSendPacket,
+			wantLen:  1024,
+		},
+		{
+			name:     "KeepAlive",
+			input:    [5]byte{byte(derp.FrameKeepAlive), 0x00, 0x00, 0x00, 0x00},
+			wantType: derp.FrameKeepAlive,
+			wantLen:  0,
+		},
+		{
+			name:     "MaxLen",
+			input:    [5]byte{byte(derp.FrameRecvPacket), 0xff, 0xff, 0xff, 0xff},
+			wantType: derp.FrameRecvPacket,
+			wantLen:  0xffffffff,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			br := bufio.NewReader(bytes.NewReader(tt.input[:]))
+			gotType, gotLen, err := derp.ReadFrameHeader(br)
+			if err != nil {
+				t.Fatalf("ReadFrameHeader: %v", err)
+			}
+			if gotType != tt.wantType {
+				t.Errorf("type = %v, want %v", gotType, tt.wantType)
+			}
+			if gotLen != tt.wantLen {
+				t.Errorf("len = %v, want %v", gotLen, tt.wantLen)
+			}
+		})
+	}
+
+	// Verify zero allocations.
+	buf := make([]byte, 4096)
+	rd := bytes.NewReader(buf)
+	br := bufio.NewReader(rd)
+	got := testing.AllocsPerRun(1000, func() {
+		rd.Reset(buf)
+		br.Reset(rd)
+		_, _, err := derp.ReadFrameHeader(br)
+		if err != nil {
+			t.Fatalf("ReadFrameHeader: %v", err)
+		}
+	})
+	if got != 0 {
+		t.Fatalf("ReadFrameHeader allocs = %f, want 0", got)
+	}
+}
+
+func TestWriteFrameHeader(t *testing.T) {
+	tests := []struct {
+		name     string
+		typ      derp.FrameType
+		frameLen uint32
+		want     [derp.FrameHeaderLen]byte
+	}{
+		{
+			name:     "SendPacket",
+			typ:      derp.FrameSendPacket,
+			frameLen: 1024,
+			want:     [derp.FrameHeaderLen]byte{byte(derp.FrameSendPacket), 0x00, 0x00, 0x04, 0x00},
+		},
+		{
+			name:     "KeepAlive",
+			typ:      derp.FrameKeepAlive,
+			frameLen: 0,
+			want:     [derp.FrameHeaderLen]byte{byte(derp.FrameKeepAlive), 0x00, 0x00, 0x00, 0x00},
+		},
+		{
+			name:     "MaxLen",
+			typ:      derp.FrameRecvPacket,
+			frameLen: 0xffffffff,
+			want:     [derp.FrameHeaderLen]byte{byte(derp.FrameRecvPacket), 0xff, 0xff, 0xff, 0xff},
+		},
+	}
+	for _, tt := range tests {
+		// Test fast path (empty buffer, plenty of space).
+		t.Run(tt.name+"/fast", func(t *testing.T) {
+			var buf bytes.Buffer
+			bw := bufio.NewWriter(&buf)
+			if err := derp.WriteFrameHeader(bw, tt.typ, tt.frameLen); err != nil {
+				t.Fatalf("WriteFrameHeader: %v", err)
+			}
+			bw.Flush()
+			if got := buf.Bytes(); !bytes.Equal(got, tt.want[:]) {
+				t.Errorf("wrote % 02x, want % 02x", got, tt.want)
+			}
+		})
+
+		// Test slow path (buffer nearly full, less than FrameHeaderLen available).
+		t.Run(tt.name+"/slow", func(t *testing.T) {
+			var buf bytes.Buffer
+			const smallBuf = 8 // small enough to force slow path
+			bw := bufio.NewWriterSize(&buf, smallBuf)
+			// Fill buffer to leave less than FrameHeaderLen bytes available.
+			padding := make([]byte, smallBuf-derp.FrameHeaderLen+1)
+			if _, err := bw.Write(padding); err != nil {
+				t.Fatalf("Write padding: %v", err)
+			}
+			if err := derp.WriteFrameHeader(bw, tt.typ, tt.frameLen); err != nil {
+				t.Fatalf("WriteFrameHeader: %v", err)
+			}
+			bw.Flush()
+			got := buf.Bytes()
+			// The header is after the padding bytes.
+			got = got[len(padding):]
+			if !bytes.Equal(got, tt.want[:]) {
+				t.Errorf("wrote % 02x, want % 02x", got, tt.want)
+			}
+		})
+	}
+
+	// Verify zero allocations on fast path.
+	bw := bufio.NewWriter(io.Discard)
+	got := testing.AllocsPerRun(1000, func() {
+		if err := derp.WriteFrameHeader(bw, derp.FrameSendPacket, 1024); err != nil {
+			t.Fatalf("WriteFrameHeader: %v", err)
+		}
+	})
+	if got != 0 {
+		t.Fatalf("WriteFrameHeader allocs = %f, want 0", got)
+	}
+}
+
+type nopRead struct{}
+
+func (nopRead) Read(p []byte) (int, error) { return len(p), nil }
+
+func BenchmarkReadFrameHeader(b *testing.B) {
+	r := bufio.NewReader(nopRead{})
+	b.ReportAllocs()
+	for b.Loop() {
+		_, _, err := derp.ReadFrameHeader(r)
+		if err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+func BenchmarkWriteFrameHeader(b *testing.B) {
+	bw := bufio.NewWriter(io.Discard)
+	b.ReportAllocs()
+	for b.Loop() {
+		if err := derp.WriteFrameHeader(bw, derp.FrameSendPacket, 1024); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
 
 func TestClientInfoUnmarshal(t *testing.T) {
 	for i, in := range map[string]struct {
@@ -121,8 +280,7 @@ func TestSendRecv(t *testing.T) {
 		}
 		defer cin.Close()
 
-		ctx, cancel := context.WithCancel(context.Background())
-		defer cancel()
+		ctx := t.Context()
 
 		brwServer := bufio.NewReadWriter(bufio.NewReader(cin), bufio.NewWriter(cin))
 		go s.Accept(ctx, cin, brwServer, fmt.Sprintf("[abc::def]:%v", i))
@@ -195,7 +353,7 @@ func TestSendRecv(t *testing.T) {
 		}
 	}
 
-	serverMetrics := s.ExpVar().(*metrics.Set)
+	serverMetrics := s.ExpVar(false).(*metrics.Set)
 
 	wantActive := func(total, home int64) {
 		t.Helper()
@@ -331,8 +489,7 @@ func TestSendFreeze(t *testing.T) {
 		return c, c2
 	}
 
-	ctx, clientCtxCancel := context.WithCancel(context.Background())
-	defer clientCtxCancel()
+	ctx := t.Context()
 
 	aliceKey := key.NewNode()
 	aliceClient, aliceConn := newClient(ctx, "alice", aliceKey)
@@ -459,13 +616,13 @@ func TestSendFreeze(t *testing.T) {
 		}
 	}
 
-	t.Run("initial send", func(t *testing.T) {
+	t.Run("initial-send", func(t *testing.T) {
 		drain(t, "bob")
 		drain(t, "cathy")
 		isEmpty(t, "alice")
 	})
 
-	t.Run("block cathy", func(t *testing.T) {
+	t.Run("block-cathy", func(t *testing.T) {
 		// Block cathy. Now the cathyConn buffer will fill up quickly,
 		// and the derp server will back up.
 		cathyConn.SetReadBlock(true)
@@ -716,8 +873,7 @@ func (c *testClient) close(t *testing.T) {
 // TestWatch tests the connection watcher mechanism used by regional
 // DERP nodes to mesh up with each other.
 func TestWatch(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	ctx := t.Context()
 
 	ts := newTestServer(t, ctx)
 	defer ts.close(t)
@@ -754,6 +910,76 @@ func TestWatch(t *testing.T) {
 	w3.wantGone(t, c1.pub)
 }
 
+// TestWatchAppName tests that the app name a client advertises in its
+// ClientInfo is relayed to watchers in peerPresent frames.
+func TestWatchAppName(t *testing.T) {
+	ctx := t.Context()
+
+	ts := newTestServer(t, ctx)
+	defer ts.close(t)
+
+	c1 := newTestClient(t, ts, "c1", func(nc net.Conn, priv key.NodePrivate, logf logger.Logf) (*Client, error) {
+		brw := bufio.NewReadWriter(bufio.NewReader(nc), bufio.NewWriter(nc))
+		c, err := derp.NewClient(priv, nc, brw, logf, derp.AppName("test-app"))
+		if err != nil {
+			return nil, err
+		}
+		waitConnect(t, c)
+		return c, nil
+	})
+
+	w := newTestWatcher(t, ts, "w")
+
+	want := map[key.NodePublic]string{
+		c1.pub: "test-app",
+		w.pub:  "",
+	}
+	for len(want) > 0 {
+		m, err := w.c.RecvTimeoutForTest(time.Second)
+		if err != nil {
+			t.Fatal(err)
+		}
+		pp, ok := m.(derp.PeerPresentMessage)
+		if !ok {
+			t.Fatalf("unexpected message type %T", m)
+		}
+		wantName, ok := want[pp.Key]
+		if !ok {
+			t.Fatalf("peer present for unexpected peer %v", ts.keyName(pp.Key))
+		}
+		if pp.AppName != wantName {
+			t.Errorf("peer %v AppName = %q; want %q", ts.keyName(pp.Key), pp.AppName, wantName)
+		}
+		delete(want, pp.Key)
+	}
+}
+
+func TestValidAppName(t *testing.T) {
+	tests := []struct {
+		name string
+		want bool
+	}{
+		{"", true},
+		{"some-client", true},
+		{"app with spaces 123!", true},
+		{strings.Repeat("x", 32), true},
+		{strings.Repeat("x", 33), false},
+		{"new\nline", false},
+		{"nul\x00", false},
+		{"emoji🐱", false},
+	}
+	for _, tt := range tests {
+		if got := derp.ValidAppName(tt.name); got != tt.want {
+			t.Errorf("ValidAppName(%q) = %v; want %v", tt.name, got, tt.want)
+		}
+	}
+
+	// NewClient should reject an invalid app name before touching the conn.
+	if _, err := derp.NewClient(key.NewNode(), nil, nil, t.Logf, derp.AppName("emoji🐱")); err == nil {
+		t.Error("NewClient with invalid app name: got nil error; want error")
+	}
+}
+
 func waitConnect(t testing.TB, c *Client) {
 	t.Helper()
 	if m, err := c.Recv(); err != nil {
@@ -764,8 +990,7 @@ func waitConnect(t testing.TB, c *Client) {
 }
 
 func TestServerRepliesToPing(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	ctx := t.Context()
 
 	ts := newTestServer(t, ctx)
 	defer ts.close(t)

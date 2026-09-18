@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 package prober
@@ -205,13 +205,24 @@ func TestProberConcurrency(t *testing.T) {
 	p.Run("foo", time.Second, nil, pfunc)
 	waitActiveProbes(t, p, clk, 1)
 
-	for range 50 {
-		clk.Advance(time.Second)
-	}
-
+	// The fake ticker drops ticks when the probe loop goroutine isn't
+	// already blocked on its channel (buffer of one, non-blocking send),
+	// so advancing the clock in a tight loop doesn't guarantee that the
+	// loop observes enough ticks to start three concurrent probe runs.
+	// Instead, advance the clock inside the polling loop so ticks keep
+	// firing until all three probe goroutines have started.
 	if err := tstest.WaitFor(convergenceTimeout, func() error {
+		clk.Advance(time.Second)
 		if got, want := ran.Load(), int64(3); got != want {
 			return fmt.Errorf("expected %d probes to run concurrently, got %d", want, got)
+		}
+		wantMetrics := `
+		# HELP prober_in_flight Number of probes currently running
+        # TYPE prober_in_flight gauge
+        prober_in_flight{class="",name="foo"} 3
+		`
+		if err := testutil.GatherAndCompare(p.metrics, strings.NewReader(wantMetrics), "prober_in_flight"); err != nil {
+			return fmt.Errorf("unexpected metrics: %w", err)
 		}
 		return nil
 	}); err != nil {
@@ -308,9 +319,12 @@ probe_end_secs{class="",label="value",name="testprobe"} %d
 # HELP probe_result Latest probe result (1 = success, 0 = failure)
 # TYPE probe_result gauge
 probe_result{class="",label="value",name="testprobe"} 0
+# HELP probe_in_flight Number of probes currently running
+# TYPE probe_in_flight gauge
+probe_in_flight{class="",label="value",name="testprobe"} 0
 `, probeInterval.Seconds(), epoch.Unix(), epoch.Add(aFewMillis).Unix())
 		return testutil.GatherAndCompare(p.metrics, strings.NewReader(want),
-			"probe_interval_secs", "probe_start_secs", "probe_end_secs", "probe_result")
+			"probe_interval_secs", "probe_start_secs", "probe_end_secs", "probe_result", "probe_in_flight")
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -338,9 +352,13 @@ probe_latency_millis{class="",label="value",name="testprobe"} %d
 # HELP probe_result Latest probe result (1 = success, 0 = failure)
 # TYPE probe_result gauge
 probe_result{class="",label="value",name="testprobe"} 1
+# HELP probe_in_flight Number of probes currently running
+# TYPE probe_in_flight gauge
+probe_in_flight{class="",label="value",name="testprobe"} 0
 `, probeInterval.Seconds(), start.Unix(), end.Unix(), aFewMillis.Milliseconds())
 		return testutil.GatherAndCompare(p.metrics, strings.NewReader(want),
-			"probe_interval_secs", "probe_start_secs", "probe_end_secs", "probe_latency_millis", "probe_result")
+			"probe_interval_secs", "probe_start_secs", "probe_end_secs",
+			"probe_latency_millis", "probe_result", "probe_in_flight")
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -778,9 +796,14 @@ func TestExcludeInRunAll(t *testing.T) {
 		},
 	}
 
-	p.Run("includedProbe", probeInterval, nil, FuncProbe(func(context.Context) error { return nil }))
-	p.Run("excludedProbe", probeInterval, nil, FuncProbe(func(context.Context) error { return nil }))
-	p.Run("excludedOtherProbe", probeInterval, nil, FuncProbe(func(context.Context) error { return nil }))
+	includedProbe := p.Run("includedProbe", probeInterval, nil, FuncProbe(func(context.Context) error { return nil }))
+	excludedProbe := p.Run("excludedProbe", probeInterval, nil, FuncProbe(func(context.Context) error { return nil }))
+	excludedOtherProbe := p.Run("excludedOtherProbe", probeInterval, nil, FuncProbe(func(context.Context) error { return nil }))
+
+	// Wait for all probes to complete their initial run
+	<-includedProbe.stopped
+	<-excludedProbe.stopped
+	<-excludedOtherProbe.stopped
 
 	mux := http.NewServeMux()
 	server := httptest.NewServer(mux)

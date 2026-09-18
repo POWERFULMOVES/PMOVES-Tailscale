@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 // Package integration contains Tailscale integration tests.
@@ -9,6 +9,7 @@ package integration
 
 import (
 	"bytes"
+	"cmp"
 	"context"
 	"crypto/tls"
 	"encoding/json"
@@ -26,9 +27,11 @@ import (
 	"path/filepath"
 	"regexp"
 	"runtime"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 
@@ -40,6 +43,7 @@ import (
 	"tailscale.com/ipn/ipnstate"
 	"tailscale.com/ipn/store"
 	"tailscale.com/net/stun/stuntest"
+	"tailscale.com/paths"
 	"tailscale.com/safesocket"
 	"tailscale.com/syncs"
 	"tailscale.com/tailcfg"
@@ -49,6 +53,7 @@ import (
 	"tailscale.com/types/logger"
 	"tailscale.com/types/logid"
 	"tailscale.com/types/nettype"
+	"tailscale.com/util/cibuild"
 	"tailscale.com/util/rands"
 	"tailscale.com/util/zstdframe"
 	"tailscale.com/version"
@@ -57,6 +62,9 @@ import (
 var (
 	verboseTailscaled = flag.Bool("verbose-tailscaled", false, "verbose tailscaled logging")
 	verboseTailscale  = flag.Bool("verbose-tailscale", false, "verbose tailscale CLI logging")
+
+	// runWindowsServiceTests enables the Windows service-mode integration tests, on by default in CI.
+	runWindowsServiceTests = flag.Bool("run-windows-service-tests", cibuild.On(), "run Windows service-mode integration tests")
 )
 
 // MainError is an error that's set if an error conditions happens outside of a
@@ -73,7 +81,11 @@ type Binaries struct {
 
 // BinaryInfo describes a tailscale or tailscaled binary.
 type BinaryInfo struct {
-	Path string // abs path to tailscale or tailscaled binary
+	// Path is the absolute path to the tailscale or tailscaled binary.
+	// This path may become invalid after the owning test's TempDir is
+	// cleaned up; use FD (or Contents on Windows) to access the binary
+	// contents.
+	Path string
 	Size int64
 
 	// FD and FDmu are set on Unix to efficiently copy the binary to a new
@@ -88,35 +100,30 @@ type BinaryInfo struct {
 	Contents []byte
 }
 
+// CopyTo copies or hardlinks the binary into dir, returning a new BinaryInfo
+// with an updated Path. The source bytes come from FD (or Contents on Windows),
+// not from b.Path, which may have been deleted when its owning test's TempDir
+// was cleaned up.
 func (b BinaryInfo) CopyTo(dir string) (BinaryInfo, error) {
 	ret := b
-	ret.Path = filepath.Join(dir, path.Base(b.Path))
+	ret.Path = filepath.Join(dir, filepath.Base(b.Path))
 
 	switch runtime.GOOS {
 	case "linux":
-		// TODO(bradfitz): be fancy and use linkat with AT_EMPTY_PATH to avoid
-		// copying? I couldn't get it to work, though.
-		// For now, just do the same thing as every other Unix and copy
-		// the binary.
+		// Try to hardlink from the open FD via /proc/self/fd, avoiding a
+		// full copy of the binary. We can't use os.Link(b.Path, ret.Path)
+		// because b.Path is in the first test's TempDir, which may be
+		// cleaned up before later tests call CopyTo. The open FD keeps the
+		// inode alive after the path is deleted, but only for reading:
+		// once the inode's link count drops to zero the kernel refuses
+		// to hardlink it again, so this fails and we fall through to
+		// copying the bytes instead.
+		if err := tryLinkat(b.FD, ret.Path); err == nil {
+			return ret, nil
+		}
 		fallthrough
 	case "darwin", "freebsd", "openbsd", "netbsd":
-		f, err := os.OpenFile(ret.Path, os.O_RDWR|os.O_CREATE|os.O_EXCL, 0o755)
-		if err != nil {
-			return BinaryInfo{}, err
-		}
-		b.FDMu.Lock()
-		b.FD.Seek(0, 0)
-		size, err := io.Copy(f, b.FD)
-		b.FDMu.Unlock()
-		if err != nil {
-			f.Close()
-			return BinaryInfo{}, fmt.Errorf("copying %q: %w", b.Path, err)
-		}
-		if size != b.Size {
-			f.Close()
-			return BinaryInfo{}, fmt.Errorf("copy %q: size mismatch: %d != %d", b.Path, size, b.Size)
-		}
-		if err := f.Close(); err != nil {
+		if err := b.writeCopy(ret.Path); err != nil {
 			return BinaryInfo{}, err
 		}
 		return ret, nil
@@ -127,12 +134,51 @@ func (b BinaryInfo) CopyTo(dir string) (BinaryInfo, error) {
 	}
 }
 
+// writeCopy writes the binary's contents from b.FD to path.
+//
+// It holds syscall.ForkLock for reading for the duration of the write
+// so that no concurrently forked child inherits the transient write
+// FD. A forked child holds inherited FDs (even O_CLOEXEC ones) until
+// it execs, and an exec of the new copy fails with ETXTBSY as long as
+// any process holds a write FD on it (golang.org/issue/22315). This
+// was the cause of the once-mysterious ETXTBSY errors
+// (https://github.com/tailscale/tailscale/issues/15868) that
+// [TestNode.awaitTailscaledRunnable] retries around.
+func (b BinaryInfo) writeCopy(path string) error {
+	syscall.ForkLock.RLock()
+	defer syscall.ForkLock.RUnlock()
+
+	f, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE|os.O_EXCL, 0o755)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	b.FDMu.Lock()
+	b.FD.Seek(0, 0)
+	size, err := io.Copy(f, b.FD)
+	b.FDMu.Unlock()
+	if err != nil {
+		return fmt.Errorf("copying %q: %w", b.Path, err)
+	}
+	if size != b.Size {
+		return fmt.Errorf("copy %q: size mismatch: %d != %d", b.Path, size, b.Size)
+	}
+	return f.Close()
+}
+
 // GetBinaries create a temp directory using tb and builds (or copies previously
 // built) cmd/tailscale and cmd/tailscaled binaries into that directory.
 //
 // It fails tb if the build or binary copies fail.
 func GetBinaries(tb testing.TB) *Binaries {
 	dir := tb.TempDir()
+	// Working around an issue with GitHub runners where provjobd.exe can keep files
+	// open for longer than the 2s tb.TempDir's own cleanup allows. See #21099.
+	tb.Cleanup(func() {
+		if err := tstest.WaitFor(60*time.Second, func() error { return os.RemoveAll(dir) }); err != nil {
+			tb.Logf("removing %s: %v", dir, err)
+		}
+	})
 	buildOnce.Do(func() {
 		buildErr = buildTestBinaries(dir)
 	})
@@ -303,7 +349,10 @@ func RunDERPAndSTUN(t testing.TB, logf logger.Logf, ipAddress string) (derpMap *
 		t.Fatal(err)
 	}
 
-	httpsrv := httptest.NewUnstartedServer(derpserver.Handler(d))
+	// Wrap with WebSocket support so browser-WASM (cmd/tsconnect) clients,
+	// which can only reach DERP via WebSocket, can use this same server.
+	handler := derpserver.AddWebSocketSupport(d, derpserver.Handler(d))
+	httpsrv := httptest.NewUnstartedServer(handler)
 	httpsrv.Listener.Close()
 	httpsrv.Listener = ln
 	httpsrv.Config.ErrorLog = logger.StdLogger(logf)
@@ -313,7 +362,7 @@ func RunDERPAndSTUN(t testing.TB, logf logger.Logf, ipAddress string) (derpMap *
 	stunAddr, stunCleanup := stuntest.ServeWithPacketListener(t, nettype.Std{})
 
 	m := &tailcfg.DERPMap{
-		Regions: map[int]*tailcfg.DERPRegion{
+		Regions: map[tailcfg.DERPRegionID]*tailcfg.DERPRegion{
 			1: {
 				RegionID:   1,
 				RegionCode: "test",
@@ -480,7 +529,6 @@ func (lc *LogCatcher) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 // or more nodes.
 type TestEnv struct {
 	t                      testing.TB
-	tunMode                bool
 	cli                    string
 	daemon                 string
 	loopbackPort           *int
@@ -522,9 +570,6 @@ func (f ConfigureControl) ModifyTestEnv(te *TestEnv) {
 // NewTestEnv starts a bunch of services and returns a new test environment.
 // NewTestEnv arranges for the environment's resources to be cleaned up on exit.
 func NewTestEnv(t testing.TB, opts ...TestEnvOpt) *TestEnv {
-	if runtime.GOOS == "windows" {
-		t.Skip("not tested/working on Windows yet")
-	}
 	derpMap := RunDERPAndSTUN(t, logger.Discard, "127.0.0.1")
 	logc := new(LogCatcher)
 	control := &testcontrol.Server{
@@ -576,27 +621,97 @@ type TestNode struct {
 	stateFile    string
 	upFlagGOOS   string // if non-empty, sets TS_DEBUG_UP_FLAG_GOOS for cmd/tailscale CLI
 	encryptState bool
+	allowUpdates bool
+	tunMode      bool // TUN rather than userspace networking
 
 	mu        sync.Mutex
 	onLogLine []func([]byte)
 	lc        *local.Client
 }
 
+// writeBlankEnvFile writes an empty env file for the node and returns its path.
+func (n *TestNode) writeBlankEnvFile() string {
+	t := n.env.t
+	t.Helper()
+	path := filepath.Join(n.dir, "tailscaled-env.txt")
+	if err := os.WriteFile(path, nil, 0o644); err != nil {
+		t.Fatalf("writing %s: %v", path, err)
+	}
+	return path
+}
+
+// TestNodeOpt represents an option that can be passed to NewTestNode.
+type TestNodeOpt interface {
+	modifyTestNode(*TestNode)
+}
+
+type tunModeOpt bool
+
+func (o tunModeOpt) modifyTestNode(n *TestNode) { n.tunMode = bool(o) }
+
+// TUNMode specifies whether TUN or userspace networking mode should be used
+// by the node. Currently, only one node can run in TUN mode at a time.
+// On Windows, TUN mode currently requires running as a service.
+func TUNMode(v bool) TestNodeOpt { return tunModeOpt(v) }
+
+// tunSlot is the node running in TUN mode, or nil, as a host has room for only one.
+var tunSlot syncs.AtomicValue[*TestNode]
+
+// defaultTUNMode reports whether a node should run in TUN mode unless told otherwise.
+func defaultTUNMode() bool {
+	return runtime.GOOS == "windows" && *runWindowsServiceTests && tunSlot.Load() == nil
+}
+
+// takeTUNSlot claims the sole TUN-mode slot for n, failing the test if it's taken.
+func takeTUNSlot(t testing.TB, n *TestNode) {
+	t.Helper()
+	if runtime.GOOS == "windows" && !*runWindowsServiceTests {
+		t.Skip("TUN mode requires running as a Windows service (re-run with --run-windows-service-tests)")
+	}
+	if !tunSlot.CompareAndSwap(nil, n) {
+		t.Fatal("only one node can run in TUN mode at a time")
+	}
+	t.Cleanup(n.releaseTUNSlot)
+}
+
+// releaseTUNSlot frees the TUN-mode slot so a later node in the test can take it.
+func (n *TestNode) releaseTUNSlot() {
+	tunSlot.CompareAndSwap(n, nil)
+}
+
 // NewTestNode allocates a temp directory for a new test node.
 // The node is not started automatically.
-func NewTestNode(t *testing.T, env *TestEnv) *TestNode {
+func NewTestNode(t *testing.T, env *TestEnv, opts ...TestNodeOpt) *TestNode {
 	dir := t.TempDir()
-	sockFile := filepath.Join(dir, "tailscale.sock")
-	if len(sockFile) >= 104 {
-		// Maximum length for a unix socket on darwin. Try something else.
-		sockFile = filepath.Join(os.TempDir(), rands.HexString(8)+".sock")
-		t.Cleanup(func() { os.Remove(sockFile) })
-	}
 	n := &TestNode{
-		env:       env,
-		dir:       dir,
-		sockFile:  sockFile,
-		stateFile: filepath.Join(dir, "tailscaled.state"), // matches what cmd/tailscaled uses
+		env:     env,
+		dir:     dir,
+		tunMode: defaultTUNMode(),
+	}
+	for _, o := range opts {
+		o.modifyTestNode(n)
+	}
+	if n.tunMode {
+		takeTUNSlot(t, n)
+	}
+
+	n.stateFile = filepath.Join(dir, "tailscaled.state") // matches what cmd/tailscaled uses
+	switch {
+	case runtime.GOOS != "windows":
+		n.sockFile = filepath.Join(dir, "tailscale.sock")
+		if len(n.sockFile) >= 104 {
+			// Maximum length for a unix socket on darwin. Try something else.
+			sockFile := filepath.Join(os.TempDir(), rands.HexString(8)+".sock")
+			n.sockFile = sockFile
+			t.Cleanup(func() { os.Remove(sockFile) })
+		}
+	case n.tunMode:
+		// A LocalSystem service ignores --socket and --statedir.
+		n.sockFile = paths.DefaultTailscaledSocket()
+		n.stateFile = paths.DefaultTailscaledStateFile()
+	default:
+		// safesocket on Windows needs a named pipe, not a file path.
+		n.sockFile = `\\.\pipe\tailscale-test-` + rands.HexString(8)
 	}
 
 	// Look for a data race or panic.
@@ -759,24 +874,54 @@ func (op *nodeOutputParser) parseLinesLocked() {
 
 type Daemon struct {
 	Process *os.Process
+
+	// node is the daemon's node, whose TUN slot MustCleanShutdown releases.
+	node *TestNode
+
+	// svc is set when the daemon is a Windows service (no owned Process);
+	// MustCleanShutdown then stops it via the SCM.
+	svc *TestNode
 }
 
 func (d *Daemon) MustCleanShutdown(t testing.TB) {
-	d.Process.Signal(os.Interrupt)
-	ps, err := d.Process.Wait()
-	if err != nil {
-		t.Fatalf("tailscaled Wait: %v", err)
+	defer d.node.releaseTUNSlot()
+	if d.svc != nil {
+		// A service is stopped via the SCM, not by interrupting its process.
+		d.svc.stopService()
+	} else if err := interruptProcess(d.Process); err != nil {
+		t.Errorf("interrupting tailscaled: %v; killing", err)
+		d.Process.Kill()
 	}
-	if ps.ExitCode() != 0 {
-		t.Errorf("tailscaled ExitCode = %d; want 0", ps.ExitCode())
+	type waitResult struct {
+		ps  *os.ProcessState
+		err error
+	}
+	done := make(chan waitResult, 1)
+	go func() {
+		ps, err := d.Process.Wait()
+		done <- waitResult{ps, err}
+	}()
+	select {
+	case got := <-done:
+		if got.err != nil {
+			t.Fatalf("tailscaled Wait: %v", got.err)
+		}
+		if got.ps.ExitCode() != 0 {
+			t.Errorf("tailscaled ExitCode = %d; want 0", got.ps.ExitCode())
+		}
+	case <-time.After(30 * time.Second):
+		t.Error("tailscaled did not exit within 30s of being asked to stop; killing")
+		d.Process.Kill()
+		<-done
 	}
 }
 
 // awaitTailscaledRunnable tries to run `tailscaled --version` until it
-// works. This is an unsatisfying workaround for ETXTBSY we were seeing
-// on GitHub Actions that aren't understood. It's not clear what's holding
-// a writable fd to tailscaled after `go install` completes.
-// See https://github.com/tailscale/tailscale/issues/15868.
+// works. It began as a workaround for mysterious ETXTBSY errors on
+// GitHub Actions (https://github.com/tailscale/tailscale/issues/15868),
+// whose cause is now understood and fixed (see [BinaryInfo.writeCopy]).
+// It remains as cheap insurance against any other transient exec
+// failure.
 func (n *TestNode) awaitTailscaledRunnable() error {
 	t := n.env.t
 	t.Helper()
@@ -793,6 +938,40 @@ func (n *TestNode) awaitTailscaledRunnable() error {
 	return nil
 }
 
+// daemonEnv returns the extra environment variables to use when starting tailscaled.
+// The ipnGOOS argument overrides [envknob.GOOS].
+func (n *TestNode) daemonEnv(ipnGOOS string) []string {
+	env := []string{
+		"TS_DEBUG_PERMIT_HTTP_C2N=1",
+		"TS_LOG_TARGET=" + n.env.LogCatcherServer.URL,
+		"HTTP_PROXY=" + n.env.TrafficTrapServer.URL,
+		"HTTPS_PROXY=" + n.env.TrafficTrapServer.URL,
+		"TS_DEBUG_FAKE_GOOS=" + ipnGOOS,
+		"TS_LOGS_DIR=" + n.dir,
+		"TS_NETCHECK_GENERATE_204_URL=" + n.env.ControlServer.URL + "/generate_204",
+		"TS_ASSUME_NETWORK_UP_FOR_TEST=1", // don't pause control client in airplane mode (no wifi, etc)
+		"TS_PANIC_IF_HIT_MAIN_CONTROL=1",
+		"TS_DISABLE_PORTMAPPER=1", // shouldn't be needed; test is all localhost
+		"TS_DEBUG_LOG_RATE=all",
+	}
+	if n.allowUpdates {
+		env = append(env, "TS_TEST_ALLOW_AUTO_UPDATE=1")
+	}
+	if n.env.loopbackPort != nil {
+		env = append(env, "TS_DEBUG_NETSTACK_LOOPBACK_PORT="+strconv.Itoa(*n.env.loopbackPort))
+	}
+	if n.env.neverDirectUDP {
+		env = append(env, "TS_DEBUG_NEVER_DIRECT_UDP=1")
+	}
+	if n.env.relayServerUseLoopback {
+		env = append(env, "TS_DEBUG_RELAY_SERVER_ADDRS=::1,127.0.0.1")
+	}
+	if version.IsRace() {
+		env = append(env, "GORACE=halt_on_error=1")
+	}
+	return env
+}
+
 // StartDaemon starts the node's tailscaled, failing if it fails to start.
 // StartDaemon ensures that the process will exit when the test completes.
 func (n *TestNode) StartDaemon() *Daemon {
@@ -806,6 +985,12 @@ func (n *TestNode) StartDaemonAsIPNGOOS(ipnGOOS string) *Daemon {
 		t.Fatalf("awaitTailscaledRunnable: %v", err)
 	}
 
+	if runtime.GOOS == "windows" && n.tunMode {
+		// TODO(#20443): plumb service logs here so races/panics/DEBUG-ADDR are seen in service mode.
+		n.tailscaledParser = &nodeOutputParser{n: n}
+		return n.startWindowsServiceDaemon()
+	}
+
 	cmd := exec.Command(n.env.daemon)
 	cmd.Args = append(cmd.Args,
 		"--statedir="+n.dir,
@@ -813,10 +998,15 @@ func (n *TestNode) StartDaemonAsIPNGOOS(ipnGOOS string) *Daemon {
 		"--socks5-server=localhost:0",
 		"--debug=localhost:0",
 	)
+	if runtime.GOOS == "windows" {
+		// On Windows, tailscaled defaults to a fixed port (41641).
+		// Force a random port to avoid collisions when running multiple test nodes.
+		cmd.Args = append(cmd.Args, "--port=0")
+	}
 	if *verboseTailscaled {
 		cmd.Args = append(cmd.Args, "-verbose=2")
 	}
-	if !n.env.tunMode {
+	if !n.tunMode {
 		cmd.Args = append(cmd.Args,
 			"--tun=userspace-networking",
 		)
@@ -827,38 +1017,25 @@ func (n *TestNode) StartDaemonAsIPNGOOS(ipnGOOS string) *Daemon {
 	if n.encryptState {
 		cmd.Args = append(cmd.Args, "--encrypt-state")
 	}
-	cmd.Env = append(os.Environ(),
-		"TS_DEBUG_PERMIT_HTTP_C2N=1",
-		"TS_LOG_TARGET="+n.env.LogCatcherServer.URL,
-		"HTTP_PROXY="+n.env.TrafficTrapServer.URL,
-		"HTTPS_PROXY="+n.env.TrafficTrapServer.URL,
-		"TS_DEBUG_FAKE_GOOS="+ipnGOOS,
-		"TS_LOGS_DIR="+t.TempDir(),
-		"TS_NETCHECK_GENERATE_204_URL="+n.env.ControlServer.URL+"/generate_204",
-		"TS_ASSUME_NETWORK_UP_FOR_TEST=1", // don't pause control client in airplane mode (no wifi, etc)
-		"TS_PANIC_IF_HIT_MAIN_CONTROL=1",
-		"TS_DISABLE_PORTMAPPER=1", // shouldn't be needed; test is all localhost
-		"TS_DEBUG_LOG_RATE=all",
-	)
-	if n.env.loopbackPort != nil {
-		cmd.Env = append(cmd.Env, "TS_DEBUG_NETSTACK_LOOPBACK_PORT="+strconv.Itoa(*n.env.loopbackPort))
-	}
-	if n.env.neverDirectUDP {
-		cmd.Env = append(cmd.Env, "TS_DEBUG_NEVER_DIRECT_UDP=1")
-	}
-	if n.env.relayServerUseLoopback {
-		cmd.Env = append(cmd.Env, "TS_DEBUG_RELAY_SERVER_ADDRS=::1,127.0.0.1")
-	}
-	if version.IsRace() {
-		cmd.Env = append(cmd.Env, "GORACE=halt_on_error=1")
-	}
+	cmd.Env = append(os.Environ(), n.daemonEnv(ipnGOOS)...)
 	n.tailscaledParser = &nodeOutputParser{n: n}
 	cmd.Stderr = n.tailscaledParser
 	if *verboseTailscaled {
 		cmd.Stdout = os.Stdout
 		cmd.Stderr = io.MultiWriter(cmd.Stderr, os.Stderr)
 	}
-	if runtime.GOOS != "windows" {
+	if runtime.GOOS == "windows" {
+		// On Windows, tailscaled always reads environment variables from
+		// %programdata%\Tailscale\tailscaled-env.txt if the file exists and
+		// TS_DEBUG_ENV_FILE isn't set.
+		//
+		// Therefore, to prevent tailscaled from reading environment variables
+		// from the global file, we need to point it to an empty file.
+		// The environment variables to be used by the daemon are instead passed
+		// via cmd.Env.
+		cmd.Env = append(cmd.Env, "TS_DEBUG_ENV_FILE="+n.writeBlankEnvFile())
+		setNewProcessGroup(cmd)
+	} else {
 		pr, pw, err := os.Pipe()
 		if err != nil {
 			t.Fatal(err)
@@ -870,9 +1047,15 @@ func (n *TestNode) StartDaemonAsIPNGOOS(ipnGOOS string) *Daemon {
 	if err := cmd.Start(); err != nil {
 		t.Fatalf("starting tailscaled: %v", err)
 	}
-	t.Cleanup(func() { cmd.Process.Kill() })
+	// Wait too: Kill only requests termination, and Windows holds the executable
+	// until the process is gone. See #21099.
+	t.Cleanup(func() {
+		cmd.Process.Kill()
+		cmd.Process.Wait()
+	})
 	return &Daemon{
 		Process: cmd.Process,
+		node:    n,
 	}
 }
 
@@ -900,6 +1083,20 @@ func (n *TestNode) MustDown() {
 	if err := n.Tailscale("down", "--accept-risk=all").Run(); err != nil {
 		t.Fatalf("down: %v", err)
 	}
+
+	// The tailscale down command is asynchronous, so it returns early.
+	// Wait for tailscaled to drop its connection before continuing.
+	if err := tstest.WaitFor(time.Second, func() error {
+		if err := t.Context().Err(); err != nil {
+			return err
+		}
+		if c := n.env.Control.InServeMap(); c != 0 {
+			return fmt.Errorf("%d connections remaining in serve map", c)
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("tailscale down: %v", err)
+	}
 }
 
 func (n *TestNode) MustLogOut() {
@@ -914,7 +1111,7 @@ func (n *TestNode) Ping(otherNode *TestNode) error {
 	t := n.env.t
 	ip := otherNode.AwaitIP4().String()
 	t.Logf("Running ping %v (from %v)...", ip, n.AwaitIP4())
-	return n.Tailscale("ping", ip).Run()
+	return n.Tailscale("ping", "--timeout=1s", ip).Run()
 }
 
 // AwaitListening waits for the tailscaled to be serving local clients
@@ -1033,6 +1230,16 @@ func (n *TestNode) TailscaleForOutput(arg ...string) *exec.Cmd {
 // Tailscale returns a command that runs the tailscale CLI with the provided arguments.
 // It does not start the process.
 func (n *TestNode) Tailscale(arg ...string) *exec.Cmd {
+	isUp := len(arg) > 0 && arg[0] == "up"
+	if isUp && cmp.Or(n.upFlagGOOS, runtime.GOOS) == "windows" {
+		isBareUp := len(arg) == 1
+		// --unattended keeps the current profile after the CLI exits; without it
+		// Windows switches to an empty background profile and the node drops to NoState.
+		// TODO(yaruk): also run tests without --unattended; see #20751.
+		if !isBareUp && !slices.Contains(arg, "--unattended") {
+			arg = append(arg, "--unattended")
+		}
+	}
 	cmd := exec.Command(n.env.cli)
 	cmd.Args = append(cmd.Args, "--socket="+n.sockFile)
 	cmd.Args = append(cmd.Args, arg...)
@@ -1040,6 +1247,9 @@ func (n *TestNode) Tailscale(arg ...string) *exec.Cmd {
 	cmd.Env = append(os.Environ(),
 		"TS_DEBUG_UP_FLAG_GOOS="+n.upFlagGOOS,
 		"TS_LOGS_DIR="+n.env.t.TempDir(),
+		"SSH_CLIENT=",     // Clear SSH_CLIENT to prevent isSSHOverTailscale() false positives in tests
+		"SSH_CONNECTION=", // just in case
+		"SSH_AUTH_SOCK=",  // just in case
 	)
 	if *verboseTailscale {
 		cmd.Stdout = os.Stdout
@@ -1071,6 +1281,46 @@ func (n *TestNode) MustStatus() *ipnstate.Status {
 		tb.Fatal(err)
 	}
 	return st
+}
+
+// PublicKey returns the hex-encoded public key of this node,
+// e.g. `nodekey:123456abc`
+func (n *TestNode) PublicKey() string {
+	tb := n.env.t
+	tb.Helper()
+	cmd := n.Tailscale("status", "--json")
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		tb.Fatalf("running `tailscale status`: %v, %s", err, out)
+	}
+
+	type Self struct{ PublicKey string }
+	type StatusOutput struct{ Self Self }
+
+	var st StatusOutput
+	if err := json.Unmarshal(out, &st); err != nil {
+		tb.Fatalf("decoding `tailscale status` JSON: %v\njson:\n%s", err, out)
+	}
+	return st.Self.PublicKey
+}
+
+// NLPublicKey returns the hex-encoded tailnet lock public key of
+// this node, e.g. `tlpub:123456abc`
+func (n *TestNode) NLPublicKey() string {
+	tb := n.env.t
+	tb.Helper()
+	cmd := n.Tailscale("lock", "status", "--json")
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		tb.Fatalf("running `tailscale lock status`: %v, %s", err, out)
+	}
+	st := struct {
+		PublicKey string `json:"PublicKey"`
+	}{}
+	if err := json.Unmarshal(out, &st); err != nil {
+		tb.Fatalf("decoding `tailscale lock status` JSON: %v\njson:\n%s", err, out)
+	}
+	return st.PublicKey
 }
 
 // trafficTrap is an HTTP proxy handler to note whether any
